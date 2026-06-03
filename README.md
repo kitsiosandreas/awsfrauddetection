@@ -21,34 +21,9 @@ Data Generator (ECS Fargate)
 ## Project Structure
 
 ```
-fraud-detection-demo/
-β"œβ"€β"€ README.md                          ← This file
-β"œβ"€β"€ cdk/                               ← CDK infrastructure (Python)
-β"‚   β"œβ"€β"€ app.py                         ← CDK app entry point
-β"‚   β"œβ"€β"€ cdk.json
-β"‚   β"œβ"€β"€ requirements.txt
-β"‚   └── stacks/
-β"‚       β"œβ"€β"€ networking_stack.py
-β"‚       β"œβ"€β"€ data_storage_stack.py
-β"‚       β"œβ"€β"€ streaming_stack.py
-β"‚       β"œβ"€β"€ graph_stack.py
-β"‚       β"œβ"€β"€ search_stack.py
-β"‚       β"œβ"€β"€ ml_stack.py
-β"‚       β"œβ"€β"€ processing_stack.py
-β"‚       β"œβ"€β"€ alerting_stack.py
-β"‚       └── compute_stack.py
-β"œβ"€β"€ data_generator/                    ← Synthetic data generator (Python)
-β"‚   β"œβ"€β"€ Dockerfile
-β"‚   β"œβ"€β"€ requirements.txt
-β"‚   β"œβ"€β"€ main.py                        ← Entry point
-β"‚   β"œβ"€β"€ config.py                      ← Runtime configuration
-β"‚   β"œβ"€β"€ personas/                      ← Fraud persona implementations
-β"‚   β"‚   β"œβ"€β"€ base.py
-β"‚   β"‚   β"œβ"€β"€ normal_trader.py
-fraud-detection-demo/
- README.md                          ← This file
- cdk/                               ← CDK infrastructure (Python)
--    app.py                         ← CDK app entry point
+README.md                          ← This file
+cdk/                               ← CDK infrastructure (Python)
+-    app.py                        ← CDK app entry point
 -    cdk.json
 -    requirements.txt
 -   └── stacks/
