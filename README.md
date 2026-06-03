@@ -45,67 +45,91 @@ fraud-detection-demo/
 β"‚   β"œβ"€β"€ personas/                      ← Fraud persona implementations
 β"‚   β"‚   β"œβ"€β"€ base.py
 β"‚   β"‚   β"œβ"€β"€ normal_trader.py
-β"‚   β"‚   β"œβ"€β"€ coordinated_ring.py
-β"‚   β"‚   β"œβ"€β"€ system_abuser.py
-β"‚   β"‚   β"œβ"€β"€ abusive_registrant.py
-β"‚   β"‚   └── ato_attacker.py
-β"‚   β"œβ"€β"€ producers/                     ← Kafka topic producers
-β"‚   β"‚   β"œβ"€β"€ trade_producer.py
-β"‚   β"‚   β"œβ"€β"€ session_producer.py
-β"‚   β"‚   β"œβ"€β"€ registration_producer.py
-β"‚   β"‚   └── api_call_producer.py
-β"‚   β"œβ"€β"€ seeders/                       ← RDS & S3 data seeders
-β"‚   β"‚   β"œβ"€β"€ rds_seeder.py
-β"‚   β"‚   └── s3_seeder.py
-β"‚   └── utils/
-β"‚       β"œβ"€β"€ geo_data.py
-β"‚       β"œβ"€β"€ device_fingerprint.py
-β"‚       └── kyc_generator.py
-β"œβ"€β"€ flink_jobs/                        ← Flink Python/SQL jobs
-β"‚   β"œβ"€β"€ coordinated_trading/
-β"‚   β"‚   β"œβ"€β"€ job.py
-β"‚   β"‚   └── rules.py
-β"‚   β"œβ"€β"€ system_abuse/
-β"‚   β"‚   β"œβ"€β"€ job.py
-β"‚   β"‚   └── rules.py
-β"‚   └── account_takeover/
-β"‚       β"œβ"€β"€ job.py
-β"‚       └── rules.py
-β"œβ"€β"€ ml_models/                         ← SageMaker training notebooks & inference
-β"‚   β"œβ"€β"€ coordinated_trading/
-β"‚   β"‚   β"œβ"€β"€ train.py
-β"‚   β"‚   └── inference.py
-β"‚   β"œβ"€β"€ registration_anomaly/
-β"‚   β"‚   β"œβ"€β"€ train.py
-β"‚   β"‚   └── inference.py
-β"‚   └── login_risk/
-β"‚       β"œβ"€β"€ train.py
-β"‚       └── inference.py
-β"œβ"€β"€ lambda_functions/                  ← Lambda alert handlers
-β"‚   β"œβ"€β"€ alert_processor/
-β"‚   β"‚   β"œβ"€β"€ handler.py
-β"‚   β"‚   └── requirements.txt
-β"‚   └── topic_initializer/
-β"‚       β"œβ"€β"€ handler.py
-β"‚       └── requirements.txt
-β"œβ"€β"€ opensearch/                        ← OpenSearch index templates & dashboards
-β"‚   β"œβ"€β"€ index_templates/
-β"‚   β"‚   β"œβ"€β"€ fraud_events.json
-β"‚   β"‚   β"œβ"€β"€ fraud_alerts.json
-β"‚   β"‚   └── fraud_entities.json
-β"‚   └── dashboards/
-β"‚       β"œβ"€β"€ fraud_overview.ndjson
-β"‚       β"œβ"€β"€ coordinated_trading.ndjson
-β"‚       β"œβ"€β"€ system_abuse.ndjson
-β"‚       └── account_takeover.ndjson
-β"œβ"€β"€ db/                                ← Database schema & seed scripts
-β"‚   β"œβ"€β"€ schema.sql
-β"‚   └── seed_reference_data.sql
-β"œβ"€β"€ scripts/                           ← Deployment & utility scripts
-β"‚   β"œβ"€β"€ deploy.sh
-β"‚   β"œβ"€β"€ setup_kafka_topics.py
-β"‚   β"œβ"€β"€ upload_ml_models.py
-β"‚   └── setup_opensearch.py
+fraud-detection-demo/
+ README.md                          ← This file
+ cdk/                               ← CDK infrastructure (Python)
+-    app.py                         ← CDK app entry point
+-    cdk.json
+-    requirements.txt
+-   └── stacks/
+-        networking_stack.py
+-        data_storage_stack.py
+-        streaming_stack.py
+-        graph_stack.py
+-        search_stack.py
+-        ml_stack.py
+-        processing_stack.py
+-        alerting_stack.py
+-       └── compute_stack.py
+ data_generator/                    ← Synthetic data generator (Python)
+-    Dockerfile
+-    requirements.txt
+-    main.py                        ← Entry point
+-    config.py                      ← Runtime configuration
+-    personas/                      ← Fraud persona implementations
+-   -    base.py
+-   -    normal_trader.py
+-   -    coordinated_ring.py
+-   -    system_abuser.py
+-   -    abusive_registrant.py
+-   -   └── ato_attacker.py
+-    producers/                     ← Kafka topic producers
+-   -    trade_producer.py
+-   -    session_producer.py
+-   -    registration_producer.py
+-   -   └── api_call_producer.py
+-    seeders/                       ← RDS & S3 data seeders
+-   -    rds_seeder.py
+-   -   └── s3_seeder.py
+-   └── utils/
+-        geo_data.py
+-        device_fingerprint.py
+-       └── kyc_generator.py
+ flink_jobs/                        ← Flink Python/SQL jobs
+-    coordinated_trading/
+-   -    job.py
+-   -   └── rules.py
+-    system_abuse/
+-   -    job.py
+-   -   └── rules.py
+-   └── account_takeover/
+-        job.py
+-       └── rules.py
+ ml_models/                         ← SageMaker training notebooks & inference
+-    coordinated_trading/
+-   -    train.py
+-   -   └── inference.py
+-    registration_anomaly/
+-   -    train.py
+-   -   └── inference.py
+-   └── login_risk/
+-        train.py
+-       └── inference.py
+ lambda_functions/                  ← Lambda alert handlers
+-    alert_processor/
+-   -    handler.py
+-   -   └── requirements.txt
+-   └── topic_initializer/
+-        handler.py
+-       └── requirements.txt
+ opensearch/                        ← OpenSearch index templates & dashboards
+-    index_templates/
+-   -    fraud_events.json
+-   -    fraud_alerts.json
+-   -   └── fraud_entities.json
+-   └── dashboards/
+-        fraud_overview.ndjson
+-        coordinated_trading.ndjson
+-        system_abuse.ndjson
+-       └── account_takeover.ndjson
+ db/                                ← Database schema & seed scripts
+-    schema.sql
+-   └── seed_reference_data.sql
+ scripts/                           ← Deployment & utility scripts
+-    deploy.sh
+-    setup_kafka_topics.py
+-    upload_ml_models.py
+-   └── setup_opensearch.py
 └── docs/
     └── demo_runbook.md                ← Step-by-step presenter guide
 ```
