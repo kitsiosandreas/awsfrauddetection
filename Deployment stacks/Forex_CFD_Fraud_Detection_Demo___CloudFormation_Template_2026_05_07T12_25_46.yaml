@@ -1,0 +1,1701 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Forex/CFD Fraud Detection Demo - Real-time fraud detection platform
+  combining rule-based (Flink CEP) and ML-based detection (SageMaker)
+  across three typologies: Coordinated Trading, System Abuse, and Account Takeover.
+  Deployed on internal AWS account with synthetic data.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: fraud-demo
+    Description: Environment prefix for all resource names
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  PublicSubnet3Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: [IP_ADDRESS]
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.14.0/22
+
+  PrivateSubnet3Cidr:
+    Type: String
+    Default: 10.0.18.0/22
+
+  IsolatedSubnet1Cidr:
+    Type: String
+    Default: [IP_ADDRESS]
+
+  IsolatedSubnet2Cidr:
+    Type: String
+    Default: 10.0.101.0/24
+
+  IsolatedSubnet3Cidr:
+    Type: String
+    Default: 10.0.102.0/24
+
+  RdsInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.m5.large
+    Description: RDS instance type
+
+  RdsMasterUsername:
+    Type: String
+    Default: fraud_admin
+    NoEcho: true
+
+  RdsMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Master password for RDS (min 12 characters)
+
+  MskInstanceType:
+    Type: String
+    Default: kafka.m5.large
+    AllowedValues:
+      - kafka.m5.large
+      - kafka.m5.xlarge
+
+  MskKafkaVersion:
+    Type: String
+    Default: 3.6.0
+
+  NeptuneInstanceClass:
+    Type: String
+    Default: db.r5.large
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: m5.large.search
+
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.m5.large
+
+  FlinkRuntimeEnvironment:
+    Type: String
+    Default: FLINK-1_18
+
+  AlertEmail:
+    Type: String
+    Default: fraud-demo-alerts@example.com
+    Description: Email for critical fraud alert notifications
+
+  ProjectTag:
+    Type: String
+    Default: FraudDetectionDemo
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PublicSubnet3Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - PrivateSubnet3Cidr
+          - IsolatedSubnet1Cidr
+          - IsolatedSubnet2Cidr
+          - IsolatedSubnet3Cidr
+      - Label:
+          default: Database Configuration
+        Parameters:
+          - RdsInstanceClass
+          - RdsMasterUsername
+          - RdsMasterPassword
+      - Label:
+          default: Streaming Configuration
+        Parameters:
+          - MskInstanceType
+          - MskKafkaVersion
+      - Label:
+          default: Analytics & ML Configuration
+        Parameters:
+          - NeptuneInstanceClass
+          - OpenSearchInstanceType
+          - SageMakerInstanceType
+          - FlinkRuntimeEnvironment
+      - Label:
+          default: Alerting & General
+        Parameters:
+          - AlertEmail
+          - EnvironmentName
+          - ProjectTag
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 1: NETWORKING (VPC, Subnets, Gateways, Security Groups)
+  # ===========================================================================
+
+  # --- VPC ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Internet Gateway ---
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # --- Public Subnets ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-2'
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet3Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-3'
+
+  # --- Private Subnets (with NAT egress) ---
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-2'
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet3Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-3'
+
+  # --- Isolated Subnets (no internet access — for RDS, Neptune) ---
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref IsolatedSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-1'
+
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref IsolatedSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-2'
+
+  IsolatedSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Ref IsolatedSubnet3Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-3'
+
+  # --- NAT Gateways (HA — one per AZ for private subnets) ---
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-2'
+
+  # --- Route Tables ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: [IP_ADDRESS]
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet3
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-1'
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: [IP_ADDRESS]
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-2'
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: [IP_ADDRESS]
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet3
+
+  IsolatedRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-rt'
+
+  IsolatedSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IsolatedRouteTable
+      SubnetId: !Ref IsolatedSubnet1
+
+  IsolatedSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IsolatedRouteTable
+      SubnetId: !Ref IsolatedSubnet2
+
+  IsolatedSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IsolatedRouteTable
+      SubnetId: !Ref IsolatedSubnet3
+
+  # --- VPC Endpoints ---
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+        - !Ref IsolatedRouteTable
+
+  DynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+        - !Ref IsolatedRouteTable
+
+  SageMakerRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sagemaker.runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # --- Security Groups ---
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Interface Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpce-sg'
+
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MSK brokers
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-msk-sg'
+
+  FlinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Flink applications
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-flink-sg'
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rds-sg'
+
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Neptune cluster
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune-sg'
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenSearch domain
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-opensearch-sg'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lambda-sg'
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS data generator tasks
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-sg'
+
+  # --- Security Group Ingress Rules ---
+  # Flink → MSK
+  MskIngressFromFlink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9092
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref FlinkSecurityGroup
+      Description: Flink to MSK (plaintext + TLS + IAM auth)
+
+  # Lambda → MSK
+  MskIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9092
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Lambda to MSK
+
+  # ECS → MSK
+  MskIngressFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9092
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: ECS Data Generator to MSK
+
+  # Flink → RDS
+  RdsIngressFromFlink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref FlinkSecurityGroup
+      Description: Flink to RDS PostgreSQL
+
+  # Lambda → RDS
+  RdsIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Lambda to RDS PostgreSQL
+
+  # Flink → Neptune
+  NeptuneIngressFromFlink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref FlinkSecurityGroup
+      Description: Flink to Neptune (Gremlin)
+
+  # Lambda → Neptune
+  NeptuneIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Lambda to Neptune
+
+  # Flink → OpenSearch
+  OpenSearchIngressFromFlink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OpenSearchSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref FlinkSecurityGroup
+      Description: Flink to OpenSearch
+
+  # Lambda → OpenSearch
+  OpenSearchIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OpenSearchSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Lambda to OpenSearch
+
+  # ===========================================================================
+  # SECTION 2: DATA STORAGE (RDS, S3, DynamoDB)
+  # ===========================================================================
+
+  # --- RDS Credentials (Secrets Manager) ---
+  RdsCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/rds/credentials'
+      Description: RDS PostgreSQL credentials for fraud detection demo
+      SecretString: !Sub |
+        {
+          "username": "${RdsMasterUsername}",
+          "password": "${RdsMasterPassword}",
+          "engine": "postgres",
+          "host": "placeholder",
+          "port": 5432,
+          "dbname": "fraud_detection"
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- RDS Parameter Group (CDC enabled) ---
+  RdsParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${EnvironmentName}-postgres15-cdc'
+      Description: PostgreSQL 15 with logical replication for Debezium CDC
+      Family: postgres15
+      Parameters:
+        rds.logical_replication: '1'
+        max_replication_slots: '10'
+        max_wal_senders: '10'
+        wal_level: logical
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- RDS Subnet Group ---
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${EnvironmentName}-rds-subnets'
+      DBSubnetGroupDescription: Isolated subnets for RDS
+      SubnetIds:
+        - !Ref IsolatedSubnet1
+        - !Ref IsolatedSubnet2
+        - !Ref IsolatedSubnet3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- RDS PostgreSQL Instance ---
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-postgres'
+      DBInstanceClass: !Ref RdsInstanceClass
+      Engine: postgres
+      EngineVersion: '15.4'
+      MasterUsername: !Ref RdsMasterUsername
+      MasterUserPassword: !Ref RdsMasterPassword
+      DBName: fraud_detection
+      AllocatedStorage: 100
+      MaxAllocatedStorage: 200
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      DBParameterGroupName: !Ref RdsParameterGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-postgres'
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- S3 Buckets ---
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-raw-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldData
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  MlArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-ml-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  FlinkArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-flink-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  EnrichmentDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-enrichment-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- DynamoDB Tables ---
+  EntityStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-entity-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: entity_id
+          AttributeType: S
+        - AttributeName: entity_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: entity_id
+          KeyType: HASH
+        - AttributeName: entity_type
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  VelocityTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-velocity'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: counter_key
+          AttributeType: S
+        - AttributeName: window_start
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: counter_key
+          KeyType: HASH
+        - AttributeName: window_start
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-alerts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alert_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: 'N'
+        - AttributeName: entity_id
+          AttributeType: S
+        - AttributeName: typology
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: by-entity
+          KeySchema:
+            - AttributeName: entity_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: by-typology
+          KeySchema:
+            - AttributeName: typology
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # ===========================================================================
+  # SECTION 3: STREAMING (Amazon MSK)
+  # ===========================================================================
+
+  # --- MSK Configuration ---
+  MskConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub '${EnvironmentName}-msk-config'
+      Description: MSK configuration for fraud detection demo
+      KafkaVersionsList:
+        - !Ref MskKafkaVersion
+      ServerProperties: |
+        auto.create.topics.enable=false
+        default.replication.factor=2
+        min.insync.replicas=1
+        num.partitions=6
+        num.io.threads=8
+        num.network.threads=5
+        log.retention.hours=24
+        log.retention.bytes=10737418240
+        message.max.bytes=1048576
+        compression.type=lz4
+
+  # --- MSK Cluster ---
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      KafkaVersion: !Ref MskKafkaVersion
+      NumberOfBrokerNodes: 3
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref MskInstanceType
+        ClientSubnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PrivateSubnet3
+        SecurityGroups:
+          - !Ref MskSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: 100
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+        Unauthenticated:
+          Enabled: false
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      ConfigurationInfo:
+        Arn: !Ref MskConfiguration
+        Revision: 1
+      EnhancedMonitoring: PER_TOPIC_PER_BROKER
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref MskLogGroup
+      Tags:
+        Project: !Ref ProjectTag
+
+  MskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/msk/${EnvironmentName}'
+      RetentionInDays: 7
+
+  # ===========================================================================
+  # SECTION 4: GRAPH DATABASE (Amazon Neptune)
+  # ===========================================================================
+
+  # --- Neptune Subnet Group ---
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${EnvironmentName}-neptune-subnets'
+      DBSubnetGroupDescription: Isolated subnets for Neptune
+      SubnetIds:
+        - !Ref IsolatedSubnet1
+        - !Ref IsolatedSubnet2
+        - !Ref IsolatedSubnet3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Neptune Cluster Parameter Group ---
+  NeptuneClusterParameterGroup:
+    Type: AWS::Neptune::DBClusterParameterGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-neptune-cluster-params'
+      Family: neptune1.3
+      Description: Neptune cluster parameters for fraud detection
+      Parameters:
+        neptune_enable_audit_log: '1'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Neptune Cluster ---
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub '${EnvironmentName}-graph'
+      EngineVersion: 1.3.1.0
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      DBClusterParameterGroupName: !Ref NeptuneClusterParameterGroup
+      IamAuthEnabled: true
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune'
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Neptune Instance ---
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-neptune-1'
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      DBClusterIdentifier: !Ref NeptuneCluster
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Neptune Loader Role (for bulk graph data import) ---
+  NeptuneLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-neptune-loader'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NeptuneS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt EnrichmentDataBucket.Arn
+                  - !Sub '${EnrichmentDataBucket.Arn}/*'
+
+  # ===========================================================================
+  # SECTION 5: SEARCH & INVESTIGATION (Amazon OpenSearch Service)
+  # ===========================================================================
+
+  # --- OpenSearch Service-Linked Role ---
+  # Note: This may already exist in your account. Remove if deployment fails.
+  # OpenSearchServiceLinkedRole:
+  #   Type: AWS::IAM::ServiceLinkedRole
+  #   Properties:
+  #     AWSServiceName: es.amazonaws.com
+
+  # --- OpenSearch Domain ---
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    DeletionPolicy: Delete
+    Properties:
+      DomainName: !Sub '${EnvironmentName}-search'
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 2
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 100
+      VPCOptions:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: fraud_admin
+          MasterUserPassword: !Ref RdsMasterPassword
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: es:*
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-search/*'
+      LogPublishingOptions:
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchAppLogGroup.Arn
+          Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  OpenSearchAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${EnvironmentName}-search/app-logs'
+      RetentionInDays: 7
+
+  # Resource policy for OpenSearch to write to CloudWatch Logs
+  OpenSearchLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${EnvironmentName}-opensearch-log-policy'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "es.amazonaws.com" },
+            "Action": [
+              "logs:PutLogEvents",
+              "logs:CreateLogStream"
+            ],
+            "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/${EnvironmentName}-search/*"
+          }]
+        }
+
+  # ===========================================================================
+  # SECTION 6: ML PLATFORM (Amazon SageMaker)
+  # ===========================================================================
+
+  # --- SageMaker Execution Role ---
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-sagemaker-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3ModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt MlArtifactsBucket.Arn
+                  - !Sub '${MlArtifactsBucket.Arn}/*'
+        - PolicyName: FeatureStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:GetRecord
+                  - sagemaker:PutRecord
+                  - sagemaker:BatchGetRecord
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:feature-group/${EnvironmentName}-*'
+
+  # --- SageMaker Feature Group: Account Trading Profile ---
+  AccountTradingFeatureGroup:
+    Type: AWS::SageMaker::FeatureGroup
+    Properties:
+      FeatureGroupName: !Sub '${EnvironmentName}-account-trading-profile'
+      RecordIdentifierFeatureName: account_id
+      EventTimeFeatureName: event_time
+      OnlineStoreConfig:
+        EnableOnlineStore: true
+      OfflineStoreConfig:
+        S3StorageConfig:
+          S3Uri: !Sub 's3://${MlArtifactsBucket}/feature-store/account-trading/'
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      FeatureDefinitions:
+        - FeatureName: account_id
+          FeatureType: String
+        - FeatureName: event_time
+          FeatureType: Fractional
+        - FeatureName: avg_trade_size_7d
+          FeatureType: Fractional
+        - FeatureName: trade_count_24h
+          FeatureType: Integral
+        - FeatureName: unique_instruments_7d
+          FeatureType: Integral
+        - FeatureName: avg_hold_duration_min
+          FeatureType: Fractional
+        - FeatureName: pnl_volatility_7d
+          FeatureType: Fractional
+        - FeatureName: peak_trading_hour
+          FeatureType: Integral
+        - FeatureName: instrument_concentration
+          FeatureType: Fractional
+        - FeatureName: correlated_accounts_count
+          FeatureType: Integral
+        - FeatureName: cluster_id
+          FeatureType: String
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- SageMaker Feature Group: Login Behavior Profile ---
+  LoginBehaviorFeatureGroup:
+    Type: AWS::SageMaker::FeatureGroup
+    Properties:
+      FeatureGroupName: !Sub '${EnvironmentName}-login-behavior'
+      RecordIdentifierFeatureName: account_id
+      EventTimeFeatureName: event_time
+      OnlineStoreConfig:
+        EnableOnlineStore: true
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      FeatureDefinitions:
+        - FeatureName: account_id
+          FeatureType: String
+        - FeatureName: event_time
+          FeatureType: Fractional
+        - FeatureName: known_device_count
+          FeatureType: Integral
+        - FeatureName: known_ip_count
+          FeatureType: Integral
+        - FeatureName: avg_session_duration_min
+          FeatureType: Fractional
+        - FeatureName: login_hour_mode
+          FeatureType: Integral
+        - FeatureName: country_code_primary
+          FeatureType: String
+        - FeatureName: failed_login_count_7d
+          FeatureType: Integral
+        - FeatureName: password_reset_count_30d
+          FeatureType: Integral
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- SageMaker Endpoint Configurations ---
+  # NOTE: SageMaker Models must be created first via SDK/CLI after training
+  # These endpoint configs reference model names that are created by the ML training pipeline
+
+  # Coordinated Trading Model Endpoint Config
+  CoordinatedTradingEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    DependsOn: SageMakerExecutionRole
+    Properties:
+      EndpointConfigName: !Sub '${EnvironmentName}-coordinated-trading'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !Sub '${EnvironmentName}-coordinated-trading-model'
+          InstanceType: !Ref SageMakerInstanceType
+          InitialInstanceCount: 1
+          InitialVariantWeight: 1.0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # Login Risk Scoring Endpoint Config
+  LoginRiskEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    DependsOn: SageMakerExecutionRole
+    Properties:
+      EndpointConfigName: !Sub '${EnvironmentName}-login-risk'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !Sub '${EnvironmentName}-login-risk-model'
+          InstanceType: !Ref SageMakerInstanceType
+          InitialInstanceCount: 1
+          InitialVariantWeight: 1.0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # Registration Anomaly Endpoint Config
+  RegistrationAnomalyEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    DependsOn: SageMakerExecutionRole
+    Properties:
+      EndpointConfigName: !Sub '${EnvironmentName}-registration-anomaly'
+      ProductionVariants:
+        - VariantName: primary
+          ModelName: !Sub '${EnvironmentName}-registration-anomaly-model'
+          InstanceType: !Ref SageMakerInstanceType
+          InitialInstanceCount: 1
+          InitialVariantWeight: 1.0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # ===========================================================================
+  # SECTION 7: STREAM PROCESSING (Amazon Managed Service for Apache Flink)
+  # ===========================================================================
+
+  # --- Flink Execution Role ---
+  FlinkExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-flink-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MskAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeGroup
+                  - kafka-cluster:AlterGroup
+                Resource:
+                  - !GetAtt MskCluster.Arn
+                  - !Sub '${MskCluster.Arn}/*'
+        - PolicyName: SageMakerInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${EnvironmentName}-*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt EntityStateTable.Arn
+                  - !GetAtt SessionTable.Arn
+                  - !GetAtt VelocityTable.Arn
+                  - !GetAtt AlertsTable.Arn
+                  - !Sub '${AlertsTable.Arn}/index/*'
+        - PolicyName: NeptuneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:*
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster}/*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FlinkArtifactsBucket.Arn
+                  - !Sub '${FlinkArtifactsBucket.Arn}/*'
+                  - !GetAtt EnrichmentDataBucket.Arn
+                  - !Sub '${EnrichmentDataBucket.Arn}/*'
+        - PolicyName: VpcAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  # --- Flink Log Groups ---
+  FlinkCoordinatedTradingLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/flink/${EnvironmentName}-coordinated-trading'
+      RetentionInDays: 7
+
+  FlinkSystemAbuseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/flink/${EnvironmentName}-system-abuse'
+      RetentionInDays: 7
+
+  FlinkAccountTakeoverLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/flink/${EnvironmentName}-account-takeover'
+      RetentionInDays: 7
+
+  # --- Flink Application: Coordinated Trading Detection ---
+  CoordinatedTradingFlinkApp:
+    Type: AWS::KinesisAnalyticsV2::Application
+    DependsOn:
+      - MskCluster
+      - FlinkExecutionRole
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-coordinated-trading'
+      RuntimeEnvironment: !Ref FlinkRuntimeEnvironment
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt FlinkArtifactsBucket.Arn
+              FileKey: flink-apps/coordinated-trading-1.0.0.jar
+          CodeContentType: ZIPFILE
+        FlinkApplicationConfiguration:
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: 4
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: false
+          CheckpointConfiguration:
+            ConfigurationType: CUSTOM
+            CheckpointingEnabled: true
+            CheckpointInterval: 60000
+            MinPauseBetweenCheckpoints: 30000
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: INFO
+            MetricsLevel: APPLICATION
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: KafkaSource
+              PropertyMap:
+                topic: trades.raw
+                group.id: flink-coordinated-trading
+            - PropertyGroupId: KafkaSink
+              PropertyMap:
+                topic: alerts.fraud
+            - PropertyGroupId: SageMaker
+              PropertyMap:
+                endpoint.name: !Sub '${EnvironmentName}-coordinated-trading'
+                region: !Ref AWS::Region
+            - PropertyGroupId: Neptune
+              PropertyMap:
+                port: '8182'
+            - PropertyGroupId: DynamoDB
+              PropertyMap:
+                entity.table: !Ref EntityStateTable
+                velocity.table: !Ref VelocityTable
+        VpcConfigurations:
+          - SubnetIds:
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+            SecurityGroupIds:
+              - !Ref FlinkSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Flink Application: System Abuse Detection ---
+  SystemAbuseFlinkApp:
+    Type: AWS::KinesisAnalyticsV2::Application
+    DependsOn:
+      - MskCluster
+      - FlinkExecutionRole
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-system-abuse'
+      RuntimeEnvironment: !Ref FlinkRuntimeEnvironment
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt FlinkArtifactsBucket.Arn
+              FileKey: flink-apps/system-abuse-1.0.0.jar
+          CodeContentType: ZIPFILE
+        FlinkApplicationConfiguration:
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: 2
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: false
+          CheckpointConfiguration:
+            ConfigurationType: CUSTOM
+            CheckpointingEnabled: true
+            CheckpointInterval: 60000
+            MinPauseBetweenCheckpoints: 30000
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: INFO
+            MetricsLevel: APPLICATION
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: KafkaSource
+              PropertyMap:
+                topics: registrations.raw,api.calls
+                group.id: flink-system-abuse
+            - PropertyGroupId: KafkaSink
+              PropertyMap:
+                topic: alerts.fraud
+            - PropertyGroupId: SageMaker
+              PropertyMap:
+                endpoint.name: !Sub '${EnvironmentName}-registration-anomaly'
+                region: !Ref AWS::Region
+            - PropertyGroupId: DynamoDB
+              PropertyMap:
+                entity.table: !Ref EntityStateTable
+                velocity.table: !Ref VelocityTable
+        VpcConfigurations:
+          - SubnetIds:
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+            SecurityGroupIds:
+              - !Ref FlinkSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Flink Application: Account Takeover Detection ---
+  AccountTakeoverFlinkApp:
+    Type: AWS::KinesisAnalyticsV2::Application
+    DependsOn:
+      - MskCluster
+      - FlinkExecutionRole
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-account-takeover'
+      RuntimeEnvironment: !Ref FlinkRuntimeEnvironment
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt FlinkArtifactsBucket.Arn
+              FileKey: flink-apps/account-takeover-1.0.0.jar
+          CodeContentType: ZIPFILE
+        FlinkApplicationConfiguration:
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: 2
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: false
+          CheckpointConfiguration:
+            ConfigurationType: CUSTOM
+            CheckpointingEnabled: true
+            CheckpointInterval: 60000
+            MinPauseBetweenCheckpoints: 30000
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: INFO
+            MetricsLevel: APPLICATION
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: KafkaSource
+              PropertyMap:
+                topic: sessions.raw
+                group.id: flink-account-takeover
+            - PropertyGroupId: KafkaSink
+              PropertyMap:
+                topic: alerts.fraud
+            - PropertyGroupId: SageMaker
+              PropertyMap:
+                endpoint.name: !Sub '${EnvironmentName}-login-risk'
+                region: !Ref AWS::Region
+            - PropertyGroupId: DynamoDB
+              PropertyMap:
+                entity.table: !Ref EntityStateTable
+                session.table: !Ref SessionTable
+                velocity.table: !Ref VelocityTable
+        VpcConfigurations:
+          - SubnetIds:
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+            SecurityGroupIds:
+              - !Ref FlinkSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # ===========================================================================
+  # SECTION 8: ALERTING (EventBridge, SNS, Step Functions)
+  # ===========================================================================
+
+  # --- SNS Topics ---
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-critical-alerts'
+      DisplayName: Fraud Detection - Critical Alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  StandardAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-standard-alerts'
+      DisplayName: Fraud Detection - Standard Alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- SNS Email Subscription ---
+  CriticalAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref
