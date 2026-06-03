@@ -8,14 +8,14 @@ and Account Takeover (ATO).
 
 ```
 Data Generator (ECS Fargate)
-    β†" MSK (Kafka) — 7 topics
-    β†" Amazon Managed Flink — 3 detection apps
-    β†" SageMaker Endpoints — 3 ML models
-    β†" Neptune — account graph
-    β†" OpenSearch — dashboards & alerting
-    β†" DynamoDB — alert store & velocity counters
-    β†" RDS PostgreSQL — account master data
-    β†" SNS + EventBridge — alert fan-out
+    - MSK (Kafka) — 7 topics
+    - Amazon Managed Flink — 3 detection apps
+    - SageMaker Endpoints — 3 ML models
+    - Neptune — account graph
+    - OpenSearch — dashboards & alerting
+    - DynamoDB — alert store & velocity counters
+    - RDS PostgreSQL — account master data
+    - SNS + EventBridge — alert fan-out
 ```
 
 ## Project Structure
