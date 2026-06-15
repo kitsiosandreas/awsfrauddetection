@@ -1,0 +1,1463 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Forex/CFD Fraud Detection Demo — v3 (Kinesis + Lambda, no SageMaker).
+  Detection runs as pure-Python heuristics inside Lambda ZipFile code.
+  Two steps: (1) deploy this template, (2) run the CodeBuild bootstrap once.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: fraud-demo
+    Description: Prefix for all resource names
+
+  AlertEmail:
+    Type: String
+    Description: Email for CRITICAL/HIGH fraud alert notifications
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+
+  RdsMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: RDS master password (min 12 chars)
+
+  GeneratorScenario:
+    Type: String
+    Default: mixed
+    AllowedValues: [mixed, coordinated_ring, ato_attack, registration_burst, system_abuse, normal]
+
+  GeneratorTps:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 500
+
+  GeneratorAccounts:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 5000
+
+  RdsInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues: [db.r5.large, db.r5.xlarge, db.m5.large]
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Required"}
+        Parameters: [AlertEmail, RdsMasterPassword]
+      - Label: {default: "Generator"}
+        Parameters: [GeneratorScenario, GeneratorTps, GeneratorAccounts]
+      - Label: {default: "Sizing"}
+        Parameters: [RdsInstanceClass]
+      - Label: {default: "General"}
+        Parameters: [EnvironmentName]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # NETWORKING
+  # ===========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-vpc'}, {Key: Project, Value: FraudDetectionDemo}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-public-1'}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-public-2'}]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.20.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-private-1'}]
+
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.10.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-isolated-1'}]
+
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-isolated-2'}]
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties: {Domain: vpc}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-nat'}]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PubSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PublicRT, SubnetId: !Ref PublicSubnet1}}
+  PubSub2RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PublicRT, SubnetId: !Ref PublicSubnet2}}
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PrivateRT, SubnetId: !Ref PrivateSubnet1}}
+
+  IsolatedRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  IsolSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref IsolatedRT, SubnetId: !Ref IsolatedSubnet1}}
+  IsolSub2RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref IsolatedRT, SubnetId: !Ref IsolatedSubnet2}}
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRT, !Ref IsolatedRT]
+
+  RdsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-rds-sg'}]
+
+  EcsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS data generator
+      VpcId: !Ref VPC
+      SecurityGroupEgress: [{IpProtocol: -1, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-ecs-sg'}]
+
+  CodeBuildSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CodeBuild bootstrap
+      VpcId: !Ref VPC
+      SecurityGroupEgress: [{IpProtocol: -1, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-codebuild-sg'}]
+
+  RdsFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EcsSG
+
+  RdsFromCodeBuild:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref CodeBuildSG
+
+  # ===========================================================================
+  # KINESIS DATA STREAMS
+  # ===========================================================================
+
+  TradesStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-trades'
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  SessionsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-sessions'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  RegistrationsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-registrations'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  ApiCallsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-api-calls'
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  AlertsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-alerts'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  # ===========================================================================
+  # DATA STORAGE
+  # ===========================================================================
+
+  RdsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/rds/credentials'
+      SecretString: !Sub |
+        {"username":"fraud_admin","password":"${RdsMasterPassword}","engine":"postgres","port":5432,"dbname":"fraud_detection"}
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  OpenSearchSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/opensearch/admin'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"fraud_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-raw-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules: [{Id: Expire30d, Status: Enabled, ExpirationInDays: 30}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EnrichmentBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-enrichment-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-bootstrap-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EntityStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-entity-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: entity_type, AttributeType: S}
+      KeySchema:
+        - {AttributeName: entity_id, KeyType: HASH}
+        - {AttributeName: entity_type, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  VelocityTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-velocity'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: counter_key, AttributeType: S}
+        - {AttributeName: window_start, AttributeType: N}
+      KeySchema:
+        - {AttributeName: counter_key, KeyType: HASH}
+        - {AttributeName: window_start, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-alerts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: alert_id, AttributeType: S}
+        - {AttributeName: created_at, AttributeType: N}
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: typology, AttributeType: S}
+        - {AttributeName: severity, AttributeType: S}
+      KeySchema:
+        - {AttributeName: alert_id, KeyType: HASH}
+        - {AttributeName: created_at, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: by-entity
+          KeySchema:
+            - {AttributeName: entity_id, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: by-typology
+          KeySchema:
+            - {AttributeName: typology, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: by-severity
+          KeySchema:
+            - {AttributeName: severity, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  # ===========================================================================
+  # RDS POSTGRESQL
+  # ===========================================================================
+
+  RdsParamGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${EnvironmentName}-postgres15'
+      Description: PostgreSQL 15 with CDC
+      Family: postgres15
+      Parameters:
+        rds.logical_replication: '1'
+        max_replication_slots: '10'
+
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${EnvironmentName}-rds-subnets'
+      DBSubnetGroupDescription: Isolated subnets for RDS
+      SubnetIds: [!Ref IsolatedSubnet1, !Ref IsolatedSubnet2]
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-db'
+      DBInstanceClass: !Ref RdsInstanceClass
+      Engine: postgres
+      EngineVersion: '15.18'
+      MasterUsername: fraud_admin
+      MasterUserPassword: !Ref RdsMasterPassword
+      DBName: fraud_detection
+      AllocatedStorage: 100
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSG]
+      DBParameterGroupName: !Ref RdsParamGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+
+  RdsSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RdsSecret
+      TargetId: !Ref RdsInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ===========================================================================
+  # OPENSEARCH
+  # ===========================================================================
+
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${EnvironmentName}'
+      RetentionInDays: 7
+
+  OpenSearchLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${EnvironmentName}-os-log-policy'
+      PolicyDocument: !Sub |
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"es.amazonaws.com"},"Action":["logs:PutLogEvents","logs:CreateLogStream"],"Resource":"${OpenSearchLogGroup.Arn}"}]}
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    DependsOn: OpenSearchLogPolicy
+    Properties:
+      DomainName: !Sub '${EnvironmentName}-search'
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: m5.large.search
+        InstanceCount: 1
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 100
+      NodeToNodeEncryptionOptions: {Enabled: true}
+      EncryptionAtRestOptions: {Enabled: true}
+      DomainEndpointOptions: {EnforceHTTPS: true}
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: fraud_admin
+          MasterUserPassword: !Sub '{{resolve:secretsmanager:${OpenSearchSecret}:SecretString:password}}'
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: '*'}
+            Action: 'es:*'
+            Resource: !Sub 'arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-search/*'
+      LogPublishingOptions:
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  # ===========================================================================
+  # IAM ROLES
+  # ===========================================================================
+
+  DetectorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DetectorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListShards, kinesis:ListStreams]
+                Resource: '*'
+              - Effect: Allow
+                Action: kinesis:PutRecord
+                Resource: !GetAtt AlertsStream.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt EntityStateTable.Arn
+                  - !GetAtt VelocityTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  AlertProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AlertProcessorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListShards]
+                Resource: !GetAtt AlertsStream.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action: [es:ESHttpPost, es:ESHttpPut]
+                Resource: !Sub '${OpenSearchDomain.Arn}/*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DatagenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:PutRecord, kinesis:PutRecords, kinesis:DescribeStream]
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RdsSecret
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+                  - !GetAtt EnrichmentBucket.Arn
+                  - !Sub '${EnrichmentBucket.Arn}/*'
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SFNPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery,
+                         logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy,
+                         logs:DescribeResourcePolicies, logs:DescribeLogGroups, logs:CreateLogGroup,
+                         logs:PutLogEvents]
+                Resource: '*'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BootstrapPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability,
+                         ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:InitiateLayerUpload,
+                         ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage,
+                         ecr:CreateRepository, ecr:DescribeRepositories]
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt BootstrapBucket.Arn
+                  - !Sub '${BootstrapBucket.Arn}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecs:RunTask, ecs:DescribeTasks, ecs:ListTasks, ecs:StopTask]
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces,
+                         ec2:DeleteNetworkInterface, ec2:DescribeSubnets,
+                         ec2:DescribeSecurityGroups, ec2:DescribeDhcpOptions,
+                         ec2:DescribeVpcs, ec2:CreateNetworkInterfacePermission]
+                Resource: '*'
+
+  # ===========================================================================
+  # ECR REPOSITORY
+  # ===========================================================================
+
+  DatagenEcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-datagen'
+      ImageTagMutability: MUTABLE
+
+  # ===========================================================================
+  # DETECTION LAMBDA FUNCTIONS
+  # Pure-Python heuristics — no SageMaker, no ML libraries required
+  # ===========================================================================
+
+  CoordTradingLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-coordinated-trading'
+      RetentionInDays: 7
+
+  CoordTradingDetector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-coordinated-trading'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          VELOCITY_TABLE: !Ref VelocityTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, os, time, uuid
+
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          vel_tbl = dynamo.Table(os.environ["VELOCITY_TABLE"])
+          ALERTS     = os.environ["ALERTS_STREAM"]
+          VEL_THRESH = 5
+          VEL_WIN    = 60
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _check_velocity(account_id, instrument, direction):
+              now = int(time.time())
+              key = account_id + ":" + instrument + ":" + direction
+              win = now - VEL_WIN
+              try:
+                  r = vel_tbl.query(
+                      KeyConditionExpression="counter_key = :k AND window_start > :w",
+                      ExpressionAttributeValues={":k": key, ":w": win},
+                  )
+                  count = r["Count"] + 1
+                  vel_tbl.put_item(Item={"counter_key": key, "window_start": now, "ttl": now + 3600})
+                  return count
+              except Exception as e:
+                  print("velocity error: " + str(e))
+                  return 1
+
+          def _heuristic_score(data, vel_count):
+              score = 0.0
+              cluster_id = data.get("cluster_id")
+              if cluster_id:
+                  score += 0.35
+              if vel_count >= VEL_THRESH:
+                  score += 0.40
+              lots = float(data.get("lots", 0))
+              if lots > 50:
+                  score += 0.15
+              pnl = float(data.get("pnl", 0))
+              if pnl > 10000:
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      instrument = data.get("instrument", "")
+                      direction  = data.get("direction", "")
+                      cluster_id = data.get("cluster_id")
+
+                      vel_count = _check_velocity(account_id, instrument, direction)
+
+                      if vel_count >= VEL_THRESH:
+                          _alert(account_id, "COORDINATED_TRADING", "HIGH",
+                                 "VELOCITY_SAME_INSTRUMENT_DIRECTION", "RULE", 0.82,
+                                 {"cluster_id": cluster_id, "instrument": instrument,
+                                  "velocity_count": vel_count})
+
+                      if cluster_id:
+                          score = _heuristic_score(data, vel_count)
+                          if score >= 0.6:
+                              _alert(account_id, "COORDINATED_TRADING", "HIGH",
+                                     "CLUSTER_HEURISTIC_SCORE", "HEURISTIC", score,
+                                     {"cluster_id": cluster_id, "instrument": instrument})
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  CoordTradingTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TradesStream.Arn
+      FunctionName: !GetAtt CoordTradingDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  ATOLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-account-takeover'
+      RetentionInDays: 7
+
+  ATODetector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-account-takeover'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          ENTITY_TABLE: !Ref EntityStateTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, math, os, time, uuid
+
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          ent_tbl = dynamo.Table(os.environ["ENTITY_TABLE"])
+          ALERTS       = os.environ["ALERTS_STREAM"]
+          GEO_KPH      = 900.0
+          CRED_THRESH  = 10
+
+          def _haversine(lat1, lon1, lat2, lon2):
+              R  = 6371.0
+              p1 = math.radians(lat1)
+              p2 = math.radians(lat2)
+              dp = math.radians(lat2 - lat1)
+              dl = math.radians(lon2 - lon1)
+              a  = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+              return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _get_state(account_id):
+              try:
+                  r = ent_tbl.get_item(Key={"entity_id": account_id, "entity_type": "ACCOUNT"})
+                  return r.get("Item", {})
+              except Exception:
+                  return {}
+
+          def _update_state(account_id, updates):
+              try:
+                  names  = {"#" + k: k for k in updates}
+                  values = {":" + k: v for k, v in updates.items()}
+                  expr   = "SET " + ", ".join("#" + k + " = :" + k for k in updates)
+                  ent_tbl.update_item(
+                      Key={"entity_id": account_id, "entity_type": "ACCOUNT"},
+                      UpdateExpression=expr,
+                      ExpressionAttributeNames=names,
+                      ExpressionAttributeValues=values,
+                  )
+              except Exception as e:
+                  print("state update error: " + str(e))
+
+          def _ato_heuristic(is_new_device, is_new_country, geo_vel, recent_fails,
+                             has_pending_withdrawal, pw_reset):
+              score = 0.0
+              if geo_vel > GEO_KPH:
+                  score += 0.50
+              elif geo_vel > 500:
+                  score += 0.25
+              if is_new_device and is_new_country:
+                  score += 0.30
+              elif is_new_device or is_new_country:
+                  score += 0.15
+              if recent_fails >= CRED_THRESH:
+                  score += 0.20
+              elif recent_fails >= 5:
+                  score += 0.10
+              if has_pending_withdrawal:
+                  score += 0.10
+              if pw_reset:
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      subtype    = data.get("event_subtype", "")
+                      lat        = float(data.get("lat", 0))
+                      lon        = float(data.get("lon", 0))
+                      epoch_ms   = float(data.get("epoch_ms", time.time() * 1000))
+                      device_id  = data.get("device_id", "")
+                      state      = _get_state(account_id)
+
+                      if subtype in ("LOGIN", "LOGIN_FAILED"):
+                          last_lat = float(state.get("last_lat", lat))
+                          last_lon = float(state.get("last_lon", lon))
+                          last_ms  = float(state.get("last_login_ms", epoch_ms))
+                          delta_h  = abs(epoch_ms - last_ms) / 3_600_000
+
+                          geo_vel = 0.0
+                          if delta_h > 0.001:
+                              dist    = _haversine(last_lat, last_lon, lat, lon)
+                              geo_vel = dist / delta_h
+
+                          if geo_vel > GEO_KPH:
+                              _alert(account_id, "ACCOUNT_TAKEOVER", "CRITICAL",
+                                     "GEO_VELOCITY_IMPOSSIBLE", "RULE", 0.92,
+                                     {"velocity_kph": round(geo_vel, 1),
+                                      "country_code": data.get("country_code")})
+
+                          if subtype == "LOGIN_FAILED":
+                              fails = int(state.get("recent_fails", 0)) + 1
+                              _update_state(account_id, {
+                                  "recent_fails": fails,
+                                  "fail_window_start": epoch_ms,
+                                  "ttl": int(time.time()) + 86400,
+                              })
+                              if fails >= CRED_THRESH:
+                                  _alert(account_id, "ACCOUNT_TAKEOVER", "HIGH",
+                                         "CREDENTIAL_STUFFING", "RULE", 0.85,
+                                         {"failed_count": fails})
+                          else:
+                              known_devices  = state.get("known_devices", [])
+                              known_countries = state.get("known_countries", [])
+                              is_new_device  = device_id not in known_devices
+                              is_new_country = data.get("country_code") not in known_countries
+                              recent_fails   = int(state.get("recent_fails", 0))
+                              hw             = int(state.get("has_pending_withdrawal", 0))
+                              pw_reset       = int(state.get("recent_pw_reset", 0))
+
+                              score = _ato_heuristic(
+                                  is_new_device, is_new_country, geo_vel,
+                                  recent_fails, hw, pw_reset,
+                              )
+                              if score >= 0.6:
+                                  _alert(account_id, "ACCOUNT_TAKEOVER", "HIGH",
+                                         "ML_HIGH_LOGIN_RISK", "HEURISTIC", score,
+                                         {"is_new_device": is_new_device,
+                                          "is_new_country": is_new_country,
+                                          "geo_velocity_kph": round(geo_vel, 1)})
+
+                              new_devices   = list(set(known_devices + [device_id]))[-20:]
+                              new_countries = list(set(known_countries + [data.get("country_code", "")]))[-20:]
+                              _update_state(account_id, {
+                                  "last_lat": lat, "last_lon": lon,
+                                  "last_login_ms": epoch_ms,
+                                  "known_devices": new_devices,
+                                  "known_countries": new_countries,
+                                  "recent_fails": 0,
+                                  "ttl": int(time.time()) + 86400 * 30,
+                              })
+
+                      elif subtype == "WITHDRAWAL_REQUEST":
+                          _update_state(account_id, {
+                              "has_pending_withdrawal": 1,
+                              "ttl": int(time.time()) + 86400,
+                          })
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  ATOTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SessionsStream.Arn
+      FunctionName: !GetAtt ATODetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  SysAbuseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-system-abuse'
+      RetentionInDays: 7
+
+  SysAbuseDetector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-system-abuse'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          VELOCITY_TABLE: !Ref VelocityTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, os, time, uuid
+
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          vel_tbl = dynamo.Table(os.environ["VELOCITY_TABLE"])
+          ALERTS     = os.environ["ALERTS_STREAM"]
+          API_THRESH = 200
+          API_WIN    = 60
+          REG_THRESH = 5
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _count_window(key, window_s, ttl_s=3600):
+              now = int(time.time())
+              win = now - window_s
+              try:
+                  r     = vel_tbl.query(
+                      KeyConditionExpression="counter_key = :k AND window_start > :w",
+                      ExpressionAttributeValues={":k": key, ":w": win},
+                  )
+                  count = r["Count"] + 1
+                  vel_tbl.put_item(Item={"counter_key": key, "window_start": now, "ttl": now + ttl_s})
+                  return count
+              except Exception:
+                  return 1
+
+          def _bot_heuristic(reg_count, form_fill_sec, hour):
+              score = 0.0
+              if reg_count >= REG_THRESH:
+                  score += 0.40
+              elif reg_count >= 3:
+                  score += 0.20
+              if form_fill_sec < 5:
+                  score += 0.35
+              elif form_fill_sec < 15:
+                  score += 0.15
+              if hour in (2, 3, 4):
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      etype      = data.get("event_type", "")
+
+                      if etype == "API_CALL":
+                          count = _count_window("api:" + account_id, API_WIN)
+                          rate  = count * (60 / API_WIN)
+                          if rate > API_THRESH:
+                              _alert(account_id, "SYSTEM_ABUSE", "MEDIUM",
+                                     "API_RATE_EXCEEDED", "RULE",
+                                     min(0.99, rate / (API_THRESH * 2)),
+                                     {"rate_per_min": round(rate, 1)})
+
+                      elif etype == "REGISTRATION":
+                          ip_prefix = ".".join(data.get("ip_address", "0.0.0.0").split(".")[:3])
+                          reg_count = _count_window("reg_ip:" + ip_prefix, 86400, 86400 * 2)
+
+                          if reg_count >= REG_THRESH:
+                              _alert(account_id, "SYSTEM_ABUSE", "HIGH",
+                                     "REGISTRATION_BURST_FROM_IP", "RULE", 0.85,
+                                     {"ip_prefix": ip_prefix, "count": reg_count})
+
+                          form_fill = float(data.get("form_fill_time_sec", 60))
+                          hour      = time.gmtime().tm_hour
+                          score     = _bot_heuristic(reg_count, form_fill, hour)
+                          if score >= 0.6:
+                              _alert(account_id, "SYSTEM_ABUSE", "HIGH",
+                                     "ML_BOT_DETECTED", "HEURISTIC", score,
+                                     {"reg_count": reg_count,
+                                      "form_fill_sec": form_fill})
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  SysAbuseTrigger1:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RegistrationsStream.Arn
+      FunctionName: !GetAtt SysAbuseDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  SysAbuseTrigger2:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ApiCallsStream.Arn
+      FunctionName: !GetAtt SysAbuseDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  # ===========================================================================
+  # ALERT PROCESSOR — reads alerts stream, writes to DynamoDB + OpenSearch + SNS
+  # ===========================================================================
+
+  AlertProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-alert-processor'
+      RetentionInDays: 7
+
+  AlertProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-alert-processor'
+      Runtime: python3.11
+      Role: !GetAtt AlertProcessorRole.Arn
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALERTS_TABLE: !Ref AlertsTable
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          CRITICAL_TOPIC_ARN: !Ref CriticalAlertsTopic
+          STANDARD_TOPIC_ARN: !Ref StandardAlertsTopic
+      Code:
+        ZipFile: |
+          import base64, boto3, json, os, time, uuid, urllib.request
+          from datetime import datetime, timezone
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          dynamo   = boto3.resource("dynamodb")
+          sns      = boto3.client("sns")
+          table    = dynamo.Table(os.environ["ALERTS_TABLE"])
+          OSEP     = os.environ["OPENSEARCH_ENDPOINT"]
+          CRIT_ARN = os.environ["CRITICAL_TOPIC_ARN"]
+          STD_ARN  = os.environ["STANDARD_TOPIC_ARN"]
+          REGION   = os.environ.get("AWS_REGION", "us-east-1")
+
+          def _index_os(alert):
+              try:
+                  date = datetime.now(timezone.utc).strftime("%Y.%m.%d")
+                  url  = "https://" + OSEP + "/fraud-alerts-" + date + "/_doc/" + alert["alert_id"]
+                  body = json.dumps(alert).encode()
+                  creds = boto3.Session().get_credentials().get_frozen_credentials()
+                  req   = AWSRequest(method="PUT", url=url, data=body)
+                  SigV4Auth(creds, "es", REGION).add_auth(req)
+                  r = urllib.request.Request(url, data=body, headers=dict(req.headers), method="PUT")
+                  urllib.request.urlopen(r, timeout=5)
+              except Exception as e:
+                  print("OpenSearch non-fatal: " + str(e))
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      alert = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      alert.setdefault("alert_id", str(uuid.uuid4()))
+                      alert["ttl"]    = int(time.time()) + 30 * 86400
+                      alert["status"] = "NEW"
+                      table.put_item(Item=alert)
+                      _index_os(alert)
+                      sev = alert.get("severity", "LOW")
+                      if sev in ("CRITICAL", "HIGH"):
+                          topic = CRIT_ARN if sev == "CRITICAL" else STD_ARN
+                          sns.publish(
+                              TopicArn=topic,
+                              Subject="[" + sev + "] Fraud Alert: " + alert.get("typology", "") + " - " + alert.get("entity_id", ""),
+                              Message=json.dumps(alert, indent=2),
+                          )
+                  except Exception as e:
+                      print("Alert error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  AlertProcessorTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt AlertsStream.Arn
+      FunctionName: !GetAtt AlertProcessorLambda.Arn
+      StartingPosition: LATEST
+      BatchSize: 50
+      MaximumBatchingWindowInSeconds: 5
+
+  # ===========================================================================
+  # ALERTING (SNS + Step Functions)
+  # ===========================================================================
+
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-critical-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  StandardAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-standard-alerts'
+
+  InvestigationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/states/${EnvironmentName}-investigation'
+      RetentionInDays: 7
+
+  InvestigationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${EnvironmentName}-investigation'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: Fraud alert triage
+        StartAt: SeverityGate
+        TimeoutSeconds: 300
+        States:
+          SeverityGate:
+            Type: Choice
+            Choices:
+              - Variable: $.severity
+                StringEquals: CRITICAL
+                Next: AutoBlock
+              - Variable: $.severity
+                StringEquals: HIGH
+                Next: FlagForReview
+            Default: MonitorWatchlist
+          AutoBlock:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id: {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision: {S: AUTO_BLOCK}
+                status: {S: BLOCKED}
+            End: true
+          FlagForReview:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id: {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision: {S: FLAG_FOR_REVIEW}
+                status: {S: REVIEWING}
+            End: true
+          MonitorWatchlist:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id: {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision: {S: MONITOR}
+                status: {S: WATCHLIST}
+            End: true
+
+  # ===========================================================================
+  # ECS FARGATE — DATA GENERATOR
+  # ===========================================================================
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-datagen'
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+
+  DatagenLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-datagen'
+      RetentionInDays: 7
+
+  DatagenTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-datagen'
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: datagen
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}:latest'
+          Essential: true
+          Environment:
+            - {Name: STREAM_TRADES,        Value: !Ref TradesStream}
+            - {Name: STREAM_SESSIONS,      Value: !Ref SessionsStream}
+            - {Name: STREAM_REGISTRATIONS, Value: !Ref RegistrationsStream}
+            - {Name: STREAM_API_CALLS,     Value: !Ref ApiCallsStream}
+            - {Name: RDS_ENDPOINT,         Value: !GetAtt RdsInstance.Endpoint.Address}
+            - {Name: RDS_SECRET_ARN,       Value: !Ref RdsSecret}
+            - {Name: RAW_DATA_BUCKET,      Value: !Ref RawDataBucket}
+            - {Name: ENRICHMENT_BUCKET,    Value: !Ref EnrichmentBucket}
+            - {Name: AWS_DEFAULT_REGION,   Value: !Ref 'AWS::Region'}
+            - {Name: SCENARIO,             Value: !Ref GeneratorScenario}
+            - {Name: TPS,                  Value: !Sub '${GeneratorTps}'}
+            - {Name: TOTAL_ACCOUNTS,       Value: !Sub '${GeneratorAccounts}'}
+            - {Name: FRAUD_RATE,           Value: '0.15'}
+            - {Name: USE_KINESIS,          Value: 'true'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DatagenLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: datagen
+
+  # ===========================================================================
+  # CODEBUILD BOOTSTRAP
+  # Builds Docker image, pushes to ECR, launches ECS task.
+  # Run ONCE after CREATE_COMPLETE:
+  #   aws codebuild start-build --project-name <BootstrapProjectName>
+  # ===========================================================================
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${EnvironmentName}-bootstrap'
+      RetentionInDays: 7
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${EnvironmentName}-bootstrap'
+      Description: Builds Docker image and launches ECS data generator. Run once after stack deployment.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: AWS_ACCOUNT_ID,        Value: !Ref 'AWS::AccountId'}
+          - {Name: AWS_DEFAULT_REGION,    Value: !Ref 'AWS::Region'}
+          - {Name: ECR_REPO_URI,          Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}'}
+          - {Name: ENV_NAME,              Value: !Ref EnvironmentName}
+          - {Name: ECS_CLUSTER,           Value: !Sub '${EnvironmentName}-datagen'}
+          - {Name: ECS_TASK_DEF,          Value: !Sub '${EnvironmentName}-datagen'}
+          - {Name: ECS_SUBNET,            Value: !Ref PublicSubnet1}
+          - {Name: ECS_SG,                Value: !Ref EcsSG}
+      Source:
+        Type: S3
+        Location: !Sub '${BootstrapBucket}/buildspec/source.zip'
+      VpcConfig:
+        VpcId: !Ref VPC
+        Subnets: [!Ref PrivateSubnet1]
+        SecurityGroupIds: [!Ref CodeBuildSG]
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  BootstrapBucketName:
+    Value: !Ref BootstrapBucket
+    Description: Upload source.zip here before running CodeBuild
+
+  BootstrapProjectName:
+    Value: !Ref BootstrapProject
+    Description: Run after CREATE_COMPLETE to build Docker image and start ECS
+
+  BootstrapCommand:
+    Value: !Sub 'aws codebuild start-build --project-name ${BootstrapProject} --region ${AWS::Region}'
+    Description: Exact command to trigger the bootstrap
+
+  TradesStreamName:
+    Value: !Ref TradesStream
+    Description: Kinesis stream for trade events
+
+  SessionsStreamName:
+    Value: !Ref SessionsStream
+    Description: Kinesis stream for session events
+
+  AlertsStreamName:
+    Value: !Ref AlertsStream
+    Description: Kinesis stream for fraud alerts
+
+  RdsEndpoint:
+    Value: !GetAtt RdsInstance.Endpoint.Address
+    Description: RDS PostgreSQL endpoint
+
+  OpenSearchDashboards:
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards'
+    Description: OpenSearch Dashboards URL
+
+  EcrRepositoryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}'
+    Description: ECR URI for data generator image
+
+  AlertsTableName:
+    Value: !Ref AlertsTable
+    Description: DynamoDB alerts table
+
+  DeploymentSummary:
+    Value: !Sub |
+      Stack deployed. Next: upload source.zip then run bootstrap.
+      Bootstrap: aws codebuild start-build --project-name ${BootstrapProject}
+      OpenSearch: https://${OpenSearchDomain.DomainEndpoint}/_dashboards (user: fraud_admin)
+      RDS: ${RdsInstance.Endpoint.Address}:5432
+      Kinesis streams: ${EnvironmentName}-trades, -sessions, -registrations, -api-calls, -alerts

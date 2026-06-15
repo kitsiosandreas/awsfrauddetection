@@ -1,211 +1,174 @@
-# Forex/CFD Fraud Detection Demo
+# Fraud Detection Demo — Self-Contained CloudFormation Deployment
 
-Real-time fraud detection platform combining rule-based and ML-based detection
-across three typologies: Coordinated Trading, System Abuse & Abusive Registrations,
-and Account Takeover (ATO).
+Deploy the entire solution with a single CloudFormation stack. No local tooling (Node.js, Docker, Python CDK) required.
 
-## Architecture
+---
 
-```
-Data Generator (ECS Fargate)
-    - MSK (Kafka) — 7 topics
-    - Amazon Managed Flink — 3 detection apps
-    - SageMaker Endpoints — 3 ML models
-    - Neptune — account graph
-    - OpenSearch — dashboards & alerting
-    - DynamoDB — alert store & velocity counters
-    - RDS PostgreSQL — account master data
-    - SNS + EventBridge — alert fan-out
-```
+## How it works
 
-## Project Structure
+The deployment is fully self-contained using two techniques:
 
-```
-README.md                          ← This file
-cdk/                               ← CDK infrastructure (Python)
--    app.py                        ← CDK app entry point
--    cdk.json
--    requirements.txt
--   └── stacks/
--        networking_stack.py
--        data_storage_stack.py
--        streaming_stack.py
--        graph_stack.py
--        search_stack.py
--        ml_stack.py
--        processing_stack.py
--        alerting_stack.py
--       └── compute_stack.py
- data_generator/                    ← Synthetic data generator (Python)
--    Dockerfile
--    requirements.txt
--    main.py                        ← Entry point
--    config.py                      ← Runtime configuration
--    personas/                      ← Fraud persona implementations
--   -    base.py
--   -    normal_trader.py
--   -    coordinated_ring.py
--   -    system_abuser.py
--   -    abusive_registrant.py
--   -   └── ato_attacker.py
--    producers/                     ← Kafka topic producers
--   -    trade_producer.py
--   -    session_producer.py
--   -    registration_producer.py
--   -   └── api_call_producer.py
--    seeders/                       ← RDS & S3 data seeders
--   -    rds_seeder.py
--   -   └── s3_seeder.py
--   └── utils/
--        geo_data.py
--        device_fingerprint.py
--       └── kyc_generator.py
- flink_jobs/                        ← Flink Python/SQL jobs
--    coordinated_trading/
--   -    job.py
--   -   └── rules.py
--    system_abuse/
--   -    job.py
--   -   └── rules.py
--   └── account_takeover/
--        job.py
--       └── rules.py
- ml_models/                         ← SageMaker training notebooks & inference
--    coordinated_trading/
--   -    train.py
--   -   └── inference.py
--    registration_anomaly/
--   -    train.py
--   -   └── inference.py
--   └── login_risk/
--        train.py
--       └── inference.py
- lambda_functions/                  ← Lambda alert handlers
--    alert_processor/
--   -    handler.py
--   -   └── requirements.txt
--   └── topic_initializer/
--        handler.py
--       └── requirements.txt
- opensearch/                        ← OpenSearch index templates & dashboards
--    index_templates/
--   -    fraud_events.json
--   -    fraud_alerts.json
--   -   └── fraud_entities.json
--   └── dashboards/
--        fraud_overview.ndjson
--        coordinated_trading.ndjson
--        system_abuse.ndjson
--       └── account_takeover.ndjson
- db/                                ← Database schema & seed scripts
--    schema.sql
--   └── seed_reference_data.sql
- scripts/                           ← Deployment & utility scripts
--    deploy.sh
--    setup_kafka_topics.py
--    upload_ml_models.py
--   └── setup_opensearch.py
-└── docs/
-    └── demo_runbook.md                ← Step-by-step presenter guide
-```
+1. **`package.py`** — a one-time script that reads all application source files from the repo, base64-encodes them, and injects them into the CloudFormation template to produce `fraud-detection-demo-packaged.yaml`.
+
+2. **CloudFormation Custom Resources** orchestrate everything at deploy time:
+
+| Custom Resource | What it does |
+|---|---|
+| `CodeBuildTrigger` | Uploads all source code to S3, triggers CodeBuild, waits for completion |
+| CodeBuild project | Builds Docker image → ECR, trains 3 ML models → S3, packages 3 Flink jobs → S3 |
+| `KafkaTopics` | Creates all 7 Kafka topics on MSK after the cluster is ready |
+| `RdsSchema` | Runs the full database DDL on RDS PostgreSQL |
+| `OpenSearchSetup` | Creates `fraud-events` and `fraud-alerts` index templates |
+| `MskBrokersSSM` | Writes MSK bootstrap broker string to SSM Parameter Store |
+| `FlinkStarter` | Starts all three Managed Flink applications |
+| `EcsStarter` | Launches the ECS Fargate data generator task |
+
+---
 
 ## Prerequisites
 
-- AWS CLI configured with sufficient IAM permissions
-- AWS CDK v2 (`npm install -g aws-cdk`)
-- Python 3.11+
-- Docker (for building data generator image)
-- Node.js 18+ (for CDK)
+- An AWS account with `AdministratorAccess` (recommended for a demo account)
+- Python 3.x and `pip` installed locally — **only needed to run `package.py` once**
+- AWS CLI configured (`aws configure`) — only needed for the deploy command
 
-## Deployment Steps
+---
 
-### 1. Bootstrap CDK (first time only)
-```bash
-cd cdk
-pip install -r requirements.txt
-cdk bootstrap
-```
+## Step 1 — Package the template (one-time, ~10 seconds)
 
-### 2. Deploy infrastructure
-```bash
-cd cdk
-cdk deploy --all --require-approval never \
-  --parameters RdsMasterPassword=YourSecurePassword123! \
-  --parameters AlertEmail=your-email@example.com
-```
-
-### 3. Set up Kafka topics
-```bash
-MSK_CLUSTER_ARN=$(aws cloudformation describe-stacks \
-  --stack-name FraudDemo-Streaming \
-  --query "Stacks[0].Outputs[?OutputKey=='MskClusterArn'].OutputValue" \
-  --output text)
-
-python scripts/setup_kafka_topics.py --cluster-arn $MSK_CLUSTER_ARN
-```
-
-### 4. Set up OpenSearch indices and dashboards
-```bash
-OPENSEARCH_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name FraudDemo-Search \
-  --query "Stacks[0].Outputs[?OutputKey=='OpenSearchEndpoint'].OutputValue" \
-  --output text)
-
-python scripts/setup_opensearch.py --endpoint $OPENSEARCH_ENDPOINT
-```
-
-### 5. Train and upload ML models
-```bash
-python scripts/upload_ml_models.py --region us-east-1
-```
-
-### 6. Start data generator
-```bash
-# Via ECS (production demo)
-aws ecs run-task \
-  --cluster fraud-demo-datagen \
-  --task-definition fraud-demo-datagen \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[...],securityGroups=[...],assignPublicIp=DISABLED}"
-
-# Or locally for testing
-cd data_generator
-pip install -r requirements.txt
-python main.py --scenario mixed --tps 100 --accounts 500
-```
-
-### 7. Start Flink applications
-```bash
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-coordinated-trading \
-  --run-configuration '{}'
-
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-system-abuse \
-  --run-configuration '{}'
-
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-account-takeover \
-  --run-configuration '{}'
-```
-
-## Demo Scenarios
-
-See [docs/demo_runbook.md](docs/demo_runbook.md) for the full presenter guide.
-
-| Scenario | Generator flag | What to show |
-|----------|---------------|--------------|
-| Baseline | `--scenario normal` | Clean dashboard, no alerts |
-| System Abuse | `--scenario registration_burst` | Rule-based alerts firing in seconds |
-| ATO | `--scenario ato_attack` | Geo-velocity alert + ML behavioural score |
-| Coordinated Ring | `--scenario coordinated_ring` | Rules pass, ML graph clustering fires |
-| All typologies | `--scenario mixed` | Full dashboard demo |
-
-## Tear Down
+This step reads the source files from the repo and injects them into the template.
 
 ```bash
-cd cdk
-cdk destroy --all
+cd cloudformation
+pip install pyyaml
+python package.py
 ```
 
-> **Note:** S3 buckets and DynamoDB tables use `RemovalPolicy.DESTROY`. All data will be deleted on stack destruction.
+This produces `fraud-detection-demo-packaged.yaml`.
+
+---
+
+## Step 2 — Deploy
+
+Upload via the AWS Console or CLI. The packaged template will likely exceed the 460 KB console upload limit, so use the CLI with S3:
+
+### Option A — AWS CLI (recommended)
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/fraud-detection-demo-packaged.yaml \
+  --stack-name fraud-detection-demo \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    AlertEmail=your-email@example.com \
+    RdsMasterPassword=YourPassword123! \
+  --region us-east-1
+```
+
+### Option B — AWS Console (CloudShell)
+
+```bash
+# Upload template to S3 first
+aws s3 cp fraud-detection-demo-packaged.yaml s3://YOUR-BUCKET/fraud-detection-demo.yaml
+
+# Then create stack via console using the S3 URL, or:
+aws cloudformation create-stack \
+  --stack-name fraud-detection-demo \
+  --template-url https://s3.amazonaws.com/YOUR-BUCKET/fraud-detection-demo.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=AlertEmail,ParameterValue=your-email@example.com \
+    ParameterKey=RdsMasterPassword,ParameterValue=YourPassword123!
+```
+
+---
+
+## Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| **AlertEmail** | — | **Required.** Email for CRITICAL/HIGH alert notifications |
+| **RdsMasterPassword** | — | **Required.** Min 12 characters |
+| GeneratorScenario | `mixed` | `mixed`, `coordinated_ring`, `ato_attack`, `registration_burst`, `system_abuse` |
+| GeneratorTps | `100` | Events per second (10–500) |
+| GeneratorAccounts | `500` | Synthetic accounts (100–5000) |
+| RdsInstanceClass | `db.r5.large` | RDS instance size |
+| MskInstanceType | `kafka.m5.large` | MSK broker instance |
+| NeptuneInstanceClass | `db.r5.large` | Neptune instance |
+| OpenSearchInstanceType | `m5.large.search` | OpenSearch node |
+| SageMakerInstanceType | `ml.m5.large` | SageMaker endpoint instance |
+
+---
+
+## Deployment timeline
+
+| Phase | Duration |
+|---|---|
+| Networking, S3, DynamoDB, IAM | ~3 min |
+| RDS, MSK, Neptune, OpenSearch | ~20–25 min (parallel) |
+| CodeBuild (Docker + ML + Flink) | ~15–20 min |
+| SageMaker endpoints | ~8 min |
+| Custom Resource bootstrapping | ~5 min |
+| **Total** | **~55–70 min** |
+
+---
+
+## Post-deployment
+
+After the stack reaches `CREATE_COMPLETE`:
+
+1. **Confirm the SNS email subscription** — check your inbox for the AWS notification email and click Confirm.
+
+2. **Access OpenSearch Dashboards** (VPC-private — use SSM port-forwarding or a bastion):
+   ```
+   URL:      https://<OpenSearchEndpoint>/_dashboards
+   Username: fraud_admin
+   Password: retrieve from Secrets Manager → fraud-demo/opensearch/admin
+   ```
+
+3. **Check Flink applications** — in the AWS Console → Managed Apache Flink, all three apps should be in `RUNNING` state. If any shows `READY`, start it manually.
+
+4. **Verify data flow:**
+   - ECS → ECS Cluster `fraud-demo-datagen` → task should be `RUNNING`
+   - MSK → Kafka topics created (check via console or `kafka-topics.sh`)
+   - Flink → CloudWatch log groups `/aws/flink/fraud-demo-*`
+   - Alerts → DynamoDB `fraud-demo-alerts` table should accumulate records
+
+---
+
+## Cost estimate
+
+~$10–16/hour while running:
+- MSK 3-broker cluster: ~$4/hr
+- OpenSearch 2-node: ~$3/hr  
+- Neptune: ~$2/hr
+- SageMaker 3× endpoints: ~$1.50/hr
+- ECS Fargate + NAT Gateways: ~$1–2/hr
+
+**Remember to delete the stack when done**: `aws cloudformation delete-stack --stack-name fraud-detection-demo`
+
+---
+
+## Architecture diagram
+
+```
+CloudFormation Stack
+       │
+       ├── CodeBuild ──builds──> ECR (Docker image)
+       │          └──uploads──> S3 (ML model.tar.gz × 3, Flink job.zip × 3)
+       │
+       ├── ECS Fargate (data generator)
+       │       │ generates synthetic trades/sessions/registrations
+       │       ▼
+       ├── Amazon MSK (Kafka 3.6, 3 brokers, IAM auth)
+       │       │ trades.raw / sessions.raw / registrations.raw / api.calls
+       │       ▼
+       ├── Managed Apache Flink (3 apps)
+       │       │ Rules + ML (SageMaker) + Graph (Neptune)
+       │       ▼ alerts.fraud
+       ├── EventBridge (fraud-detection-demo bus)
+       │       ├──> SNS (email for CRITICAL/HIGH)
+       │       ├──> Lambda (persist to DynamoDB + OpenSearch)
+       │       └──> Step Functions (triage: AutoBlock / FlagForReview / Monitor)
+       │
+       └── OpenSearch Dashboards (investigation UI)
+```
