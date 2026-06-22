@@ -1,0 +1,2379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Forex/CFD Fraud Detection Demo — QuickSight Edition (v1).
+  Replaces OpenSearch Dashboards with Amazon QuickSight via
+  Kinesis Firehose → S3 (Parquet) → Glue Catalog → Athena → QuickSight.
+  Self-contained: all source code is embedded. Two steps to deploy:
+  (1) deploy this template, (2) run the CodeBuild bootstrap once.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: fraud-demo
+    Description: Prefix for all resource names
+
+  AlertEmail:
+    Type: String
+    Description: Email for CRITICAL/HIGH fraud alert notifications
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+
+  RdsMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: RDS master password (min 12 chars)
+
+  QuickSightUserName:
+    Type: String
+    Description: >
+      QuickSight username for dashboard permissions.
+      Format: the username portion only (e.g. "admin" or "john.doe").
+      Must already exist in QuickSight default namespace.
+
+  GeneratorScenario:
+    Type: String
+    Default: mixed
+    AllowedValues: [mixed, coordinated_ring, ato_attack, registration_burst, system_abuse, normal]
+
+  GeneratorTps:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 500
+
+  GeneratorAccounts:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 5000
+
+  RdsInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues: [db.r5.large, db.r5.xlarge, db.m5.large]
+
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Required"}
+        Parameters: [AlertEmail, RdsMasterPassword, QuickSightUserName]
+      - Label: {default: "Generator"}
+        Parameters: [GeneratorScenario, GeneratorTps, GeneratorAccounts]
+      - Label: {default: "Sizing"}
+        Parameters: [RdsInstanceClass]
+      - Label: {default: "General"}
+        Parameters: [EnvironmentName]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # NETWORKING
+  # ===========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-vpc'}, {Key: Project, Value: FraudDetectionDemo}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-public-1'}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-public-2'}]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.20.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-private-1'}]
+
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.10.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-isolated-1'}]
+
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-isolated-2'}]
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties: {Domain: vpc}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-nat'}]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PubSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PublicRT, SubnetId: !Ref PublicSubnet1}}
+  PubSub2RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PublicRT, SubnetId: !Ref PublicSubnet2}}
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref PrivateRT, SubnetId: !Ref PrivateSubnet1}}
+
+  IsolatedRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  IsolSub1RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref IsolatedRT, SubnetId: !Ref IsolatedSubnet1}}
+  IsolSub2RT: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {RouteTableId: !Ref IsolatedRT, SubnetId: !Ref IsolatedSubnet2}}
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRT, !Ref IsolatedRT]
+
+  RdsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-rds-sg'}]
+
+  EcsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS data generator
+      VpcId: !Ref VPC
+      SecurityGroupEgress: [{IpProtocol: -1, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-ecs-sg'}]
+
+  CodeBuildSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CodeBuild bootstrap
+      VpcId: !Ref VPC
+      SecurityGroupEgress: [{IpProtocol: -1, CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Name, Value: !Sub '${EnvironmentName}-codebuild-sg'}]
+
+  RdsFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EcsSG
+
+  RdsFromCodeBuild:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref CodeBuildSG
+
+
+  # ===========================================================================
+  # KINESIS DATA STREAMS
+  # ===========================================================================
+
+  TradesStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-trades'
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  SessionsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-sessions'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  RegistrationsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-registrations'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  ApiCallsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-api-calls'
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  AlertsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${EnvironmentName}-alerts'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  # ===========================================================================
+  # DATA STORAGE
+  # ===========================================================================
+
+  RdsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}/rds/credentials'
+      SecretString: !Sub |
+        {"username":"fraud_admin","password":"${RdsMasterPassword}","engine":"postgres","port":5432,"dbname":"fraud_detection"}
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-raw-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules: [{Id: Expire30d, Status: Enabled, ExpirationInDays: 30}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EnrichmentBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-enrichment-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-bootstrap-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Analytics bucket: Firehose landing zone for QuickSight ───────────────
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-analytics-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules: [{Id: Expire90d, Status: Enabled, ExpirationInDays: 90}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  # QuickSight needs explicit S3 bucket policy to read Athena query results
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowQuickSightAthenaResults
+            Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+            Resource:
+              - !GetAtt AnalyticsBucket.Arn
+              - !Sub '${AnalyticsBucket.Arn}/*'
+
+  EntityStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-entity-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: entity_type, AttributeType: S}
+      KeySchema:
+        - {AttributeName: entity_id, KeyType: HASH}
+        - {AttributeName: entity_type, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  VelocityTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-velocity'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: counter_key, AttributeType: S}
+        - {AttributeName: window_start, AttributeType: N}
+      KeySchema:
+        - {AttributeName: counter_key, KeyType: HASH}
+        - {AttributeName: window_start, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${EnvironmentName}-alerts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: alert_id, AttributeType: S}
+        - {AttributeName: created_at, AttributeType: N}
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: typology, AttributeType: S}
+        - {AttributeName: severity, AttributeType: S}
+      KeySchema:
+        - {AttributeName: alert_id, KeyType: HASH}
+        - {AttributeName: created_at, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: by-entity
+          KeySchema:
+            - {AttributeName: entity_id, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: by-typology
+          KeySchema:
+            - {AttributeName: typology, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: by-severity
+          KeySchema:
+            - {AttributeName: severity, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+
+  # ===========================================================================
+  # RDS POSTGRESQL
+  # ===========================================================================
+
+  RdsParamGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${EnvironmentName}-postgres15'
+      Description: PostgreSQL 15 with CDC
+      Family: postgres15
+      Parameters:
+        rds.logical_replication: '1'
+        max_replication_slots: '10'
+
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${EnvironmentName}-rds-subnets'
+      DBSubnetGroupDescription: Isolated subnets for RDS
+      SubnetIds: [!Ref IsolatedSubnet1, !Ref IsolatedSubnet2]
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-db'
+      DBInstanceClass: !Ref RdsInstanceClass
+      Engine: postgres
+      # Major-version only: RDS selects the latest available 15.x minor at
+      # create time, so the stack never pins a deprecated/removed minor version.
+      EngineVersion: '15'
+      MasterUsername: fraud_admin
+      MasterUserPassword: !Ref RdsMasterPassword
+      DBName: fraud_detection
+      AllocatedStorage: 100
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSG]
+      DBParameterGroupName: !Ref RdsParamGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+
+  RdsSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RdsSecret
+      TargetId: !Ref RdsInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ===========================================================================
+  # GLUE DATA CATALOG — schema registry for Firehose Parquet conversion
+  # and Athena queries consumed by QuickSight
+  # ===========================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${EnvironmentName}_fraud_analytics'
+        Description: Fraud detection analytics — alerts and trades
+
+  # Explicit schema for the alerts table so Firehose can convert JSON → Parquet
+  AlertsGlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+      TableInput:
+        Name: alerts
+        Description: Fraud alerts landing table (Parquet, partitioned by date)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          'parquet.compression': SNAPPY
+        StorageDescriptor:
+          Location: !Sub 's3://${AnalyticsBucket}/alerts/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: alert_id,         Type: string}
+            - {Name: entity_id,        Type: string}
+            - {Name: entity_type,      Type: string}
+            - {Name: typology,         Type: string}
+            - {Name: severity,         Type: string}
+            - {Name: risk_score,       Type: double}
+            - {Name: signals,          Type: string}   # serialised as JSON array string; Firehose Parquet does not support complex types
+            - {Name: detection_method, Type: string}
+            - {Name: timestamp,        Type: string}
+            - {Name: created_at,       Type: bigint}
+            - {Name: status,           Type: string}
+            - {Name: cluster_id,       Type: string}
+            - {Name: instrument,       Type: string}
+            - {Name: velocity_count,   Type: int}
+            - {Name: geo_velocity_kph, Type: double}
+            - {Name: country_code,     Type: string}
+        PartitionKeys:
+          - {Name: year,  Type: string}
+          - {Name: month, Type: string}
+          - {Name: day,   Type: string}
+
+  # Schema for the trades table
+  TradesGlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+      TableInput:
+        Name: trades
+        Description: Raw trade events (Parquet, partitioned by date)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          'parquet.compression': SNAPPY
+        StorageDescriptor:
+          Location: !Sub 's3://${AnalyticsBucket}/trades/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: event_id,    Type: string}
+            - {Name: account_id,  Type: string}
+            - {Name: timestamp,   Type: string}
+            - {Name: epoch_ms,    Type: bigint}
+            - {Name: instrument,  Type: string}
+            - {Name: direction,   Type: string}
+            - {Name: lots,        Type: double}
+            - {Name: open_price,  Type: double}
+            - {Name: close_price, Type: double}
+            - {Name: trade_type,  Type: string}
+            - {Name: country_code, Type: string}
+            - {Name: ip_address,  Type: string}
+            - {Name: label,       Type: string}
+            - {Name: cluster_id,  Type: string}
+        PartitionKeys:
+          - {Name: year,  Type: string}
+          - {Name: month, Type: string}
+          - {Name: day,   Type: string}
+
+
+  # ===========================================================================
+  # IAM ROLES
+  # ===========================================================================
+
+  DetectorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DetectorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListShards, kinesis:ListStreams]
+                Resource: '*'
+              - Effect: Allow
+                Action: kinesis:PutRecord
+                Resource: !GetAtt AlertsStream.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt EntityStateTable.Arn
+                  - !GetAtt VelocityTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  # Alert processor role: writes to DynamoDB + SNS only (no OpenSearch)
+  AlertProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AlertProcessorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:GetRecords, kinesis:GetShardIterator, kinesis:DescribeStream, kinesis:ListShards, kinesis:ListStreams]
+                Resource: !GetAtt AlertsStream.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DatagenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [kinesis:PutRecord, kinesis:PutRecords, kinesis:DescribeStream]
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RdsSecret
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+                  - !GetAtt EnrichmentBucket.Arn
+                  - !Sub '${EnrichmentBucket.Arn}/*'
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SFNPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery,
+                         logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy,
+                         logs:DescribeResourcePolicies, logs:DescribeLogGroups, logs:CreateLogGroup,
+                         logs:PutLogEvents]
+                Resource: '*'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BootstrapPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability,
+                         ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:InitiateLayerUpload,
+                         ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage,
+                         ecr:CreateRepository, ecr:DescribeRepositories]
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt BootstrapBucket.Arn
+                  - !Sub '${BootstrapBucket.Arn}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecs:RunTask, ecs:DescribeTasks, ecs:ListTasks, ecs:StopTask]
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces,
+                         ec2:DeleteNetworkInterface, ec2:DescribeSubnets,
+                         ec2:DescribeSecurityGroups, ec2:DescribeDhcpOptions,
+                         ec2:DescribeVpcs, ec2:CreateNetworkInterfacePermission]
+                Resource: '*'
+
+  # ── Firehose delivery role ─────────────────────────────────────────────────
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-firehose-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FirehosePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt AnalyticsBucket.Arn
+                  - !Sub '${AnalyticsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource:
+                  - !GetAtt AlertsStream.Arn
+                  - !GetAtt TradesStream.Arn
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:PutLogEvents, logs:CreateLogGroup, logs:CreateLogStream]
+                Resource: '*'
+
+  # ── Glue crawler role ──────────────────────────────────────────────────────
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: GlueCrawlerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt AnalyticsBucket.Arn
+                  - !Sub '${AnalyticsBucket.Arn}/*'
+
+  # ── QuickSight service role ────────────────────────────────────────────────
+  QuickSightServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-quicksight-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: quicksight.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QuickSightPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:BatchGetQueryExecution
+                  - athena:CancelQueryExecution
+                  - athena:GetCatalogs
+                  - athena:GetExecutionEngine
+                  - athena:GetExecutionEngines
+                  - athena:GetNamespace
+                  - athena:GetNamespaces
+                  - athena:GetQueryExecution
+                  - athena:GetQueryExecutions
+                  - athena:GetQueryResults
+                  - athena:GetQueryResultsStream
+                  - athena:GetTable
+                  - athena:GetTables
+                  - athena:ListQueryExecutions
+                  - athena:RunQuery
+                  - athena:StartQueryExecution
+                  - athena:StopQueryExecution
+                  - athena:ListWorkGroups
+                  - athena:GetWorkGroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketAcl
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt AnalyticsBucket.Arn
+                  - !Sub '${AnalyticsBucket.Arn}/*'
+
+
+  # ===========================================================================
+  # ECR REPOSITORY
+  # ===========================================================================
+
+  DatagenEcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-datagen'
+      ImageTagMutability: MUTABLE
+
+  # ===========================================================================
+  # KINESIS DATA FIREHOSE — AlertsStream → S3 Analytics Bucket (Parquet)
+  # ===========================================================================
+
+  AlertsFirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${EnvironmentName}-alerts'
+      RetentionInDays: 7
+
+  AlertsFirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref AlertsFirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  AlertsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: [AlertsFirehoseLogStream, AlertsGlueTable]
+    Properties:
+      DeliveryStreamName: !Sub '${EnvironmentName}-alerts-firehose'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt AlertsStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt AnalyticsBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        # Hive-style partitioning lets Athena and Glue crawlers discover partitions automatically
+        Prefix: 'alerts/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'alerts-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED  # Parquet serialiser handles its own compression
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe:
+                CaseInsensitive: true
+                ConvertDotsInJsonKeysToUnderscores: false
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+                EnableDictionaryCompression: true
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+            TableName: alerts
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+            VersionId: LATEST
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref AlertsFirehoseLogGroup
+          LogStreamName: S3Delivery
+
+  # ===========================================================================
+  # KINESIS DATA FIREHOSE — TradesStream → S3 Analytics Bucket (Parquet)
+  # ===========================================================================
+
+  TradesFirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${EnvironmentName}-trades'
+      RetentionInDays: 7
+
+  TradesFirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref TradesFirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  TradesFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: [TradesFirehoseLogStream, TradesGlueTable]
+    Properties:
+      DeliveryStreamName: !Sub '${EnvironmentName}-trades-firehose'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt TradesStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt AnalyticsBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: 'trades/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'trades-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe:
+                CaseInsensitive: true
+                ConvertDotsInJsonKeysToUnderscores: false
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+                EnableDictionaryCompression: true
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+            TableName: trades
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+            VersionId: LATEST
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref TradesFirehoseLogGroup
+          LogStreamName: S3Delivery
+
+
+  # ===========================================================================
+  # GLUE CRAWLERS — auto-discover new partitions every 15 minutes
+  # ===========================================================================
+
+  AlertsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${EnvironmentName}-alerts-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: Discovers new date partitions in the alerts Parquet prefix
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${AnalyticsBucket}/alerts/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Schedule:
+        ScheduleExpression: 'cron(0/15 * * * ? *)'
+      Tags:
+        Project: FraudDetectionDemo
+
+  TradesCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${EnvironmentName}-trades-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: Discovers new date partitions in the trades Parquet prefix
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${AnalyticsBucket}/trades/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Schedule:
+        ScheduleExpression: 'cron(0/15 * * * ? *)'
+      Tags:
+        Project: FraudDetectionDemo
+
+  # ===========================================================================
+  # ATHENA WORKGROUP + NAMED QUERIES (pre-built for QuickSight datasets)
+  # ===========================================================================
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-fraud-analytics'
+      Description: Fraud detection analytics queries for QuickSight
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AnalyticsBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB safety limit
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+  # Pre-built query: fraud overview — alerts by severity and typology per day
+  AlertsOverviewQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub '${EnvironmentName}-alerts-overview'
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: >
+        Hourly alert counts grouped by severity and typology.
+        Used as the base dataset for QuickSight Fraud Overview dashboard.
+      QueryString: !Sub |
+        SELECT
+            typology,
+            severity,
+            detection_method,
+            year,
+            month,
+            day,
+            COUNT(*)                   AS alert_count,
+            AVG(risk_score)            AS avg_risk_score,
+            MAX(risk_score)            AS max_risk_score,
+            COUNT(DISTINCT entity_id)  AS distinct_entities
+        FROM "${EnvironmentName}_fraud_analytics"."alerts"
+        GROUP BY typology, severity, detection_method, year, month, day
+        ORDER BY year DESC, month DESC, day DESC
+        LIMIT 10000
+
+  # Pre-built query: entity risk — top risky accounts
+  EntityRiskQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub '${EnvironmentName}-entity-risk'
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: >
+        Top risky entities ranked by max risk score and alert count.
+        Used for QuickSight Entity Risk Monitor dashboard.
+      QueryString: !Sub |
+        SELECT
+            entity_id,
+            COUNT(*)        AS total_alerts,
+            MAX(risk_score) AS max_risk_score,
+            AVG(risk_score) AS avg_risk_score,
+            COUNT(DISTINCT typology)   AS typology_count,
+            COUNT(DISTINCT severity)   AS severity_spread,
+            MAX(CASE WHEN severity = 'CRITICAL' THEN 1 ELSE 0 END) AS has_critical,
+            MAX(CASE WHEN severity = 'HIGH'     THEN 1 ELSE 0 END) AS has_high,
+            MAX(timestamp)  AS latest_alert_ts,
+            ARBITRARY(country_code) AS country_code
+        FROM "${EnvironmentName}_fraud_analytics"."alerts"
+        GROUP BY entity_id
+        ORDER BY max_risk_score DESC, total_alerts DESC
+        LIMIT 500
+
+  # Pre-built query: alert feed — last 24h raw alerts
+  AlertFeedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub '${EnvironmentName}-alert-feed'
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: >
+        Raw alert feed for the last 7 days, ordered newest-first.
+        Used for QuickSight Alert Feed table.
+      QueryString: !Sub |
+        SELECT
+            alert_id,
+            entity_id,
+            typology,
+            severity,
+            risk_score,
+            detection_method,
+            status,
+            instrument,
+            country_code,
+            cluster_id,
+            timestamp,
+            created_at
+        FROM "${EnvironmentName}_fraud_analytics"."alerts"
+        WHERE from_unixtime(created_at / 1000) >= current_timestamp - interval '7' day
+        ORDER BY created_at DESC
+        LIMIT 10000
+
+  # Pre-built query: trade activity overview
+  TradeActivityQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub '${EnvironmentName}-trade-activity'
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Sub '${EnvironmentName}_fraud_analytics'
+      Description: >
+        Trade volume by instrument and label per day.
+        Used for QuickSight Trade Activity dashboard.
+      QueryString: !Sub |
+        SELECT
+            instrument,
+            direction,
+            label,
+            year,
+            month,
+            day,
+            COUNT(*)          AS trade_count,
+            SUM(lots)         AS total_lots,
+            AVG(lots)         AS avg_lots,
+            AVG(open_price)   AS avg_open_price,
+            COUNT(DISTINCT account_id) AS distinct_accounts
+        FROM "${EnvironmentName}_fraud_analytics"."trades"
+        GROUP BY instrument, direction, label, year, month, day
+        ORDER BY year DESC, month DESC, day DESC
+        LIMIT 10000
+
+
+  # ===========================================================================
+  # QUICKSIGHT DATA SOURCE AND DATASETS
+  # ===========================================================================
+
+  QuickSightAthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${EnvironmentName}-athena-source'
+      Name: !Sub '${EnvironmentName} Fraud Analytics (Athena)'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkgroup
+      Permissions:
+        - Principal: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserName}'
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+  # ── Dataset 1: Fraud Alerts Overview (SPICE) ──────────────────────────────
+  AlertsOverviewDataset:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: QuickSightAthenaDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${EnvironmentName}-alerts-overview-ds'
+      Name: !Sub '${EnvironmentName} Fraud Alerts Overview'
+      ImportMode: SPICE
+      PhysicalTableMap:
+        AlertsPhysicalTable:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${EnvironmentName}-athena-source'
+            Name: AlertsOverview
+            SqlQuery: !Sub |
+              SELECT
+                  typology,
+                  severity,
+                  detection_method,
+                  year,
+                  month,
+                  day,
+                  COUNT(*)                   AS alert_count,
+                  AVG(risk_score)            AS avg_risk_score,
+                  MAX(risk_score)            AS max_risk_score,
+                  COUNT(DISTINCT entity_id)  AS distinct_entities
+              FROM "${EnvironmentName}_fraud_analytics"."alerts"
+              GROUP BY typology, severity, detection_method, year, month, day
+            Columns:
+              - {Name: typology,          Type: STRING}
+              - {Name: severity,          Type: STRING}
+              - {Name: detection_method,  Type: STRING}
+              - {Name: year,              Type: STRING}
+              - {Name: month,             Type: STRING}
+              - {Name: day,               Type: STRING}
+              - {Name: alert_count,       Type: INTEGER}
+              - {Name: avg_risk_score,    Type: DECIMAL}
+              - {Name: max_risk_score,    Type: DECIMAL}
+              - {Name: distinct_entities, Type: INTEGER}
+      LogicalTableMap:
+        AlertsLogical:
+          Alias: Fraud Alerts Overview
+          Source:
+            PhysicalTableId: AlertsPhysicalTable
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: alert_date
+                    ColumnId: alert_date
+                    Expression: "parseDate(concat({year}, '-', {month}, '-', {day}), 'yyyy-MM-dd')"
+      Permissions:
+        - Principal: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserName}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+  # ── Dataset 2: Entity Risk Monitor (SPICE) ────────────────────────────────
+  EntityRiskDataset:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: QuickSightAthenaDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${EnvironmentName}-entity-risk-ds'
+      Name: !Sub '${EnvironmentName} Entity Risk Monitor'
+      ImportMode: SPICE
+      PhysicalTableMap:
+        EntityPhysicalTable:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${EnvironmentName}-athena-source'
+            Name: EntityRisk
+            SqlQuery: !Sub |
+              SELECT
+                  entity_id,
+                  COUNT(*)        AS total_alerts,
+                  MAX(risk_score) AS max_risk_score,
+                  AVG(risk_score) AS avg_risk_score,
+                  COUNT(DISTINCT typology)  AS typology_count,
+                  MAX(CASE WHEN severity = 'CRITICAL' THEN 1 ELSE 0 END) AS has_critical,
+                  MAX(CASE WHEN severity = 'HIGH'     THEN 1 ELSE 0 END) AS has_high,
+                  MAX(timestamp)  AS latest_alert_ts,
+                  ARBITRARY(country_code) AS country_code
+              FROM "${EnvironmentName}_fraud_analytics"."alerts"
+              GROUP BY entity_id
+              ORDER BY max_risk_score DESC
+              LIMIT 500
+            Columns:
+              - {Name: entity_id,       Type: STRING}
+              - {Name: total_alerts,    Type: INTEGER}
+              - {Name: max_risk_score,  Type: DECIMAL}
+              - {Name: avg_risk_score,  Type: DECIMAL}
+              - {Name: typology_count,  Type: INTEGER}
+              - {Name: has_critical,    Type: INTEGER}
+              - {Name: has_high,        Type: INTEGER}
+              - {Name: latest_alert_ts, Type: STRING}
+              - {Name: country_code,    Type: STRING}
+      LogicalTableMap:
+        EntityLogical:
+          Alias: Entity Risk Monitor
+          Source:
+            PhysicalTableId: EntityPhysicalTable
+      Permissions:
+        - Principal: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserName}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+  # ── Dataset 3: Alert Feed (DIRECT QUERY — always fresh) ───────────────────
+  AlertFeedDataset:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: QuickSightAthenaDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${EnvironmentName}-alert-feed-ds'
+      Name: !Sub '${EnvironmentName} Alert Feed (Live)'
+      ImportMode: DIRECT_QUERY  # no SPICE — always queries Athena for freshest data
+      PhysicalTableMap:
+        FeedPhysicalTable:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${EnvironmentName}-athena-source'
+            Name: AlertFeed
+            SqlQuery: !Sub |
+              SELECT
+                  alert_id,
+                  entity_id,
+                  typology,
+                  severity,
+                  risk_score,
+                  detection_method,
+                  status,
+                  instrument,
+                  country_code,
+                  cluster_id,
+                  timestamp,
+                  created_at
+              FROM "${EnvironmentName}_fraud_analytics"."alerts"
+              WHERE from_unixtime(created_at / 1000) >= current_timestamp - interval '7' day
+              ORDER BY created_at DESC
+              LIMIT 10000
+            Columns:
+              - {Name: alert_id,         Type: STRING}
+              - {Name: entity_id,        Type: STRING}
+              - {Name: typology,         Type: STRING}
+              - {Name: severity,         Type: STRING}
+              - {Name: risk_score,       Type: DECIMAL}
+              - {Name: detection_method, Type: STRING}
+              - {Name: status,           Type: STRING}
+              - {Name: instrument,       Type: STRING}
+              - {Name: country_code,     Type: STRING}
+              - {Name: cluster_id,       Type: STRING}
+              - {Name: timestamp,        Type: DATETIME}
+              - {Name: created_at,       Type: INTEGER}
+      LogicalTableMap:
+        FeedLogical:
+          Alias: Alert Feed
+          Source:
+            PhysicalTableId: FeedPhysicalTable
+      Permissions:
+        - Principal: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserName}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+  # ── Dataset 4: Trade Activity (SPICE) ─────────────────────────────────────
+  TradeActivityDataset:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: QuickSightAthenaDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${EnvironmentName}-trade-activity-ds'
+      Name: !Sub '${EnvironmentName} Trade Activity'
+      ImportMode: SPICE
+      PhysicalTableMap:
+        TradesPhysicalTable:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${EnvironmentName}-athena-source'
+            Name: TradeActivity
+            SqlQuery: !Sub |
+              SELECT
+                  instrument,
+                  direction,
+                  label,
+                  year,
+                  month,
+                  day,
+                  COUNT(*)          AS trade_count,
+                  SUM(lots)         AS total_lots,
+                  AVG(lots)         AS avg_lots,
+                  COUNT(DISTINCT account_id) AS distinct_accounts
+              FROM "${EnvironmentName}_fraud_analytics"."trades"
+              GROUP BY instrument, direction, label, year, month, day
+            Columns:
+              - {Name: instrument,        Type: STRING}
+              - {Name: direction,         Type: STRING}
+              - {Name: label,             Type: STRING}
+              - {Name: year,              Type: STRING}
+              - {Name: month,             Type: STRING}
+              - {Name: day,               Type: STRING}
+              - {Name: trade_count,       Type: INTEGER}
+              - {Name: total_lots,        Type: DECIMAL}
+              - {Name: avg_lots,          Type: DECIMAL}
+              - {Name: distinct_accounts, Type: INTEGER}
+      LogicalTableMap:
+        TradesLogical:
+          Alias: Trade Activity
+          Source:
+            PhysicalTableId: TradesPhysicalTable
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: trade_date
+                    ColumnId: trade_date
+                    Expression: "parseDate(concat({year}, '-', {month}, '-', {day}), 'yyyy-MM-dd')"
+      Permissions:
+        - Principal: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserName}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Project, Value: FraudDetectionDemo}
+
+
+  # ===========================================================================
+  # DETECTION LAMBDA FUNCTIONS (unchanged from original)
+  # ===========================================================================
+
+  CoordTradingLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-coordinated-trading'
+      RetentionInDays: 7
+
+  CoordTradingDetector:
+    Type: AWS::Lambda::Function
+    DependsOn: CoordTradingLogGroup
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-coordinated-trading'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          VELOCITY_TABLE: !Ref VelocityTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, os, time, uuid
+
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          vel_tbl = dynamo.Table(os.environ["VELOCITY_TABLE"])
+          ALERTS     = os.environ["ALERTS_STREAM"]
+          VEL_THRESH = 5
+          VEL_WIN    = 60
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _check_velocity(account_id, instrument, direction):
+              now = int(time.time())
+              key = account_id + ":" + instrument + ":" + direction
+              win = now - VEL_WIN
+              try:
+                  r = vel_tbl.query(
+                      KeyConditionExpression="counter_key = :k AND window_start > :w",
+                      ExpressionAttributeValues={":k": key, ":w": win},
+                  )
+                  count = r["Count"] + 1
+                  vel_tbl.put_item(Item={"counter_key": key, "window_start": now, "ttl": now + 3600})
+                  return count
+              except Exception as e:
+                  print("velocity error: " + str(e))
+                  return 1
+
+          def _heuristic_score(data, vel_count):
+              score = 0.0
+              cluster_id = data.get("cluster_id")
+              if cluster_id:
+                  score += 0.35
+              if vel_count >= VEL_THRESH:
+                  score += 0.40
+              lots = float(data.get("lots", 0))
+              if lots > 50:
+                  score += 0.15
+              pnl = float(data.get("pnl", 0))
+              if pnl > 10000:
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      instrument = data.get("instrument", "")
+                      direction  = data.get("direction", "")
+                      cluster_id = data.get("cluster_id")
+
+                      vel_count = _check_velocity(account_id, instrument, direction)
+
+                      if vel_count >= VEL_THRESH:
+                          _alert(account_id, "COORDINATED_TRADING", "HIGH",
+                                 "VELOCITY_SAME_INSTRUMENT_DIRECTION", "RULE", 0.82,
+                                 {"cluster_id": cluster_id, "instrument": instrument,
+                                  "velocity_count": vel_count})
+
+                      if cluster_id:
+                          score = _heuristic_score(data, vel_count)
+                          if score >= 0.6:
+                              _alert(account_id, "COORDINATED_TRADING", "HIGH",
+                                     "CLUSTER_HEURISTIC_SCORE", "HEURISTIC", score,
+                                     {"cluster_id": cluster_id, "instrument": instrument})
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  CoordTradingTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TradesStream.Arn
+      FunctionName: !GetAtt CoordTradingDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  ATOLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-account-takeover'
+      RetentionInDays: 7
+
+  ATODetector:
+    Type: AWS::Lambda::Function
+    DependsOn: ATOLogGroup
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-account-takeover'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          ENTITY_TABLE: !Ref EntityStateTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, math, os, time, uuid
+          from decimal import Decimal
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          ent_tbl = dynamo.Table(os.environ["ENTITY_TABLE"])
+          ALERTS       = os.environ["ALERTS_STREAM"]
+          GEO_KPH      = 900.0
+          CRED_THRESH  = 10
+
+          def _haversine(lat1, lon1, lat2, lon2):
+              R  = 6371.0
+              p1 = math.radians(lat1)
+              p2 = math.radians(lat2)
+              dp = math.radians(lat2 - lat1)
+              dl = math.radians(lon2 - lon1)
+              a  = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+              return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _get_state(account_id):
+              try:
+                  r = ent_tbl.get_item(Key={"entity_id": account_id, "entity_type": "ACCOUNT"})
+                  return r.get("Item", {})
+              except Exception:
+                  return {}
+
+          def _update_state(account_id, updates):
+              try:
+                  safe   = {k: Decimal(str(v)) if isinstance(v, float) else v
+                            for k, v in updates.items()}
+                  names  = {"#" + k: k for k in safe}
+                  values = {":" + k: v for k, v in safe.items()}
+                  expr   = "SET " + ", ".join("#" + k + " = :" + k for k in safe)
+                  ent_tbl.update_item(
+                      Key={"entity_id": account_id, "entity_type": "ACCOUNT"},
+                      UpdateExpression=expr,
+                      ExpressionAttributeNames=names,
+                      ExpressionAttributeValues=values,
+                  )
+              except Exception as e:
+                  print("state update error: " + str(e))
+
+          def _ato_heuristic(is_new_device, is_new_country, geo_vel, recent_fails,
+                             has_pending_withdrawal, pw_reset):
+              score = 0.0
+              if geo_vel > GEO_KPH:
+                  score += 0.50
+              elif geo_vel > 500:
+                  score += 0.25
+              if is_new_device and is_new_country:
+                  score += 0.30
+              elif is_new_device or is_new_country:
+                  score += 0.15
+              if recent_fails >= CRED_THRESH:
+                  score += 0.20
+              elif recent_fails >= 5:
+                  score += 0.10
+              if has_pending_withdrawal:
+                  score += 0.10
+              if pw_reset:
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      subtype    = data.get("event_subtype", "")
+                      lat        = float(data.get("lat", 0))
+                      lon        = float(data.get("lon", 0))
+                      epoch_ms   = float(data.get("epoch_ms", time.time() * 1000))
+                      device_id  = data.get("device_id", "")
+                      state      = _get_state(account_id)
+
+                      if subtype in ("LOGIN", "LOGIN_FAILED"):
+                          last_lat = float(state.get("last_lat", lat))
+                          last_lon = float(state.get("last_lon", lon))
+                          last_ms  = float(state.get("last_login_ms", epoch_ms))
+                          delta_h  = abs(epoch_ms - last_ms) / 3_600_000
+                          geo_vel = 0.0
+                          if delta_h > 0.001:
+                              dist    = _haversine(last_lat, last_lon, lat, lon)
+                              geo_vel = dist / delta_h
+                          if geo_vel > GEO_KPH:
+                              _alert(account_id, "ACCOUNT_TAKEOVER", "CRITICAL",
+                                     "GEO_VELOCITY_IMPOSSIBLE", "RULE", 0.92,
+                                     {"velocity_kph": round(geo_vel, 1),
+                                      "country_code": data.get("country_code")})
+                          if subtype == "LOGIN_FAILED":
+                              fails = int(state.get("recent_fails", 0)) + 1
+                              _update_state(account_id, {
+                                  "recent_fails": fails,
+                                  "fail_window_start": epoch_ms,
+                                  "ttl": int(time.time()) + 86400,
+                              })
+                              if fails >= CRED_THRESH:
+                                  _alert(account_id, "ACCOUNT_TAKEOVER", "HIGH",
+                                         "CREDENTIAL_STUFFING", "RULE", 0.85,
+                                         {"failed_count": fails})
+                          else:
+                              known_devices   = state.get("known_devices", [])
+                              known_countries = state.get("known_countries", [])
+                              is_new_device   = device_id not in known_devices
+                              is_new_country  = data.get("country_code") not in known_countries
+                              recent_fails    = int(state.get("recent_fails", 0))
+                              hw              = int(state.get("has_pending_withdrawal", 0))
+                              pw_reset        = int(state.get("recent_pw_reset", 0))
+                              score = _ato_heuristic(
+                                  is_new_device, is_new_country, geo_vel,
+                                  recent_fails, hw, pw_reset,
+                              )
+                              if score >= 0.6:
+                                  _alert(account_id, "ACCOUNT_TAKEOVER", "HIGH",
+                                         "ML_HIGH_LOGIN_RISK", "HEURISTIC", score,
+                                         {"is_new_device": is_new_device,
+                                          "is_new_country": is_new_country,
+                                          "geo_velocity_kph": round(geo_vel, 1)})
+                              new_devices   = list(set(known_devices + [device_id]))[-20:]
+                              new_countries = list(set(known_countries + [data.get("country_code", "")]))[-20:]
+                              _update_state(account_id, {
+                                  "last_lat": lat, "last_lon": lon,
+                                  "last_login_ms": epoch_ms,
+                                  "known_devices": new_devices,
+                                  "known_countries": new_countries,
+                                  "recent_fails": 0,
+                                  "ttl": int(time.time()) + 86400 * 30,
+                              })
+                      elif subtype == "WITHDRAWAL_REQUEST":
+                          _update_state(account_id, {
+                              "has_pending_withdrawal": 1,
+                              "ttl": int(time.time()) + 86400,
+                          })
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  ATOTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SessionsStream.Arn
+      FunctionName: !GetAtt ATODetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+
+  SysAbuseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-detect-system-abuse'
+      RetentionInDays: 7
+
+  SysAbuseDetector:
+    Type: AWS::Lambda::Function
+    DependsOn: SysAbuseLogGroup
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-detect-system-abuse'
+      Runtime: python3.11
+      Role: !GetAtt DetectorLambdaRole.Arn
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ALERTS_STREAM: !Ref AlertsStream
+          VELOCITY_TABLE: !Ref VelocityTable
+          ENV_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import base64, boto3, json, os, time, uuid
+
+          kinesis = boto3.client("kinesis")
+          dynamo  = boto3.resource("dynamodb")
+          vel_tbl = dynamo.Table(os.environ["VELOCITY_TABLE"])
+          ALERTS     = os.environ["ALERTS_STREAM"]
+          API_THRESH = 200
+          API_WIN    = 60
+          REG_THRESH = 5
+
+          def _alert(account_id, typology, severity, signal, method, score, extra=None):
+              a = {
+                  "alert_id": str(uuid.uuid4()),
+                  "entity_id": account_id,
+                  "entity_type": "ACCOUNT",
+                  "typology": typology,
+                  "severity": severity,
+                  "risk_score": round(score, 4),
+                  "signals": [signal],
+                  "detection_method": method,
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "created_at": int(time.time() * 1000),
+              }
+              if extra:
+                  a.update(extra)
+              kinesis.put_record(
+                  StreamName=ALERTS,
+                  Data=json.dumps(a),
+                  PartitionKey=account_id or "default",
+              )
+
+          def _count_window(key, window_s, ttl_s=3600):
+              now = int(time.time())
+              win = now - window_s
+              try:
+                  r     = vel_tbl.query(
+                      KeyConditionExpression="counter_key = :k AND window_start > :w",
+                      ExpressionAttributeValues={":k": key, ":w": win},
+                  )
+                  count = r["Count"] + 1
+                  vel_tbl.put_item(Item={"counter_key": key, "window_start": now, "ttl": now + ttl_s})
+                  return count
+              except Exception:
+                  return 1
+
+          def _bot_heuristic(reg_count, form_fill_sec, hour):
+              score = 0.0
+              if reg_count >= REG_THRESH:
+                  score += 0.40
+              elif reg_count >= 3:
+                  score += 0.20
+              if form_fill_sec < 5:
+                  score += 0.35
+              elif form_fill_sec < 15:
+                  score += 0.15
+              if hour in (2, 3, 4):
+                  score += 0.10
+              return min(score, 0.99)
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      data       = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      account_id = data.get("account_id", "")
+                      etype      = data.get("event_type", "")
+                      if etype == "API_CALL":
+                          count = _count_window("api:" + account_id, API_WIN)
+                          rate  = count * (60 / API_WIN)
+                          if rate > API_THRESH:
+                              _alert(account_id, "SYSTEM_ABUSE", "MEDIUM",
+                                     "API_RATE_EXCEEDED", "RULE",
+                                     min(0.99, rate / (API_THRESH * 2)),
+                                     {"rate_per_min": round(rate, 1)})
+                      elif etype == "REGISTRATION":
+                          ip_prefix = ".".join(data.get("ip_address", "0.0.0.0").split(".")[:3])
+                          reg_count = _count_window("reg_ip:" + ip_prefix, 86400, 86400 * 2)
+                          if reg_count >= REG_THRESH:
+                              _alert(account_id, "SYSTEM_ABUSE", "HIGH",
+                                     "REGISTRATION_BURST_FROM_IP", "RULE", 0.85,
+                                     {"ip_prefix": ip_prefix, "count": reg_count})
+                          form_fill = float(data.get("form_fill_time_sec", 60))
+                          hour      = time.gmtime().tm_hour
+                          score     = _bot_heuristic(reg_count, form_fill, hour)
+                          if score >= 0.6:
+                              _alert(account_id, "SYSTEM_ABUSE", "HIGH",
+                                     "ML_BOT_DETECTED", "HEURISTIC", score,
+                                     {"reg_count": reg_count,
+                                      "form_fill_sec": form_fill})
+                  except Exception as e:
+                      print("Record error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  SysAbuseTrigger1:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RegistrationsStream.Arn
+      FunctionName: !GetAtt SysAbuseDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  SysAbuseTrigger2:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ApiCallsStream.Arn
+      FunctionName: !GetAtt SysAbuseDetector.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+
+  # ===========================================================================
+  # ALERT PROCESSOR — reads alerts stream, writes to DynamoDB + SNS
+  # OpenSearch has been removed; S3 landing via Firehose handles analytics
+  # ===========================================================================
+
+  AlertProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-alert-processor'
+      RetentionInDays: 7
+
+  AlertProcessorLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AlertProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-alert-processor'
+      Runtime: python3.11
+      Role: !GetAtt AlertProcessorRole.Arn
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALERTS_TABLE:      !Ref AlertsTable
+          CRITICAL_TOPIC_ARN: !Ref CriticalAlertsTopic
+          STANDARD_TOPIC_ARN: !Ref StandardAlertsTopic
+      Code:
+        ZipFile: |
+          """
+          Alert Processor — writes alerts to DynamoDB for Step Functions triage
+          and publishes high-severity alerts to SNS for email notification.
+
+          Analytics ingestion (S3/Athena/QuickSight) is handled automatically
+          by the Kinesis Data Firehose delivery stream — no code required here.
+          """
+          import base64, boto3, json, os, time, uuid
+          from decimal import Decimal
+
+          dynamo   = boto3.resource("dynamodb")
+          sns      = boto3.client("sns")
+          table    = dynamo.Table(os.environ["ALERTS_TABLE"])
+          CRIT_ARN = os.environ["CRITICAL_TOPIC_ARN"]
+          STD_ARN  = os.environ["STANDARD_TOPIC_ARN"]
+
+          def _to_decimal(obj):
+              """DynamoDB requires Decimal for all float/number values."""
+              if isinstance(obj, float):  return Decimal(str(obj))
+              if isinstance(obj, dict):   return {k: _to_decimal(v) for k, v in obj.items()}
+              if isinstance(obj, list):   return [_to_decimal(i) for i in obj]
+              return obj
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      alert = json.loads(base64.b64decode(record["kinesis"]["data"]))
+                      alert.setdefault("alert_id", str(uuid.uuid4()))
+                      alert["ttl"]    = int(time.time()) + 30 * 86400
+                      alert["status"] = "NEW"
+
+                      # Persist to DynamoDB (feeds Step Functions triage)
+                      table.put_item(Item=_to_decimal(alert))
+
+                      # SNS notifications for actionable severities
+                      sev = alert.get("severity", "LOW")
+                      if sev in ("CRITICAL", "HIGH"):
+                          topic = CRIT_ARN if sev == "CRITICAL" else STD_ARN
+                          sns.publish(
+                              TopicArn=topic,
+                              Subject=(
+                                  "[" + sev + "] Fraud Alert: "
+                                  + alert.get("typology", "")
+                                  + " — "
+                                  + alert.get("entity_id", "")
+                              ),
+                              Message=json.dumps(alert, indent=2, default=str),
+                          )
+                  except Exception as e:
+                      print("Alert error: " + str(e))
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+  AlertProcessorTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt AlertsStream.Arn
+      FunctionName: !GetAtt AlertProcessorLambda.Arn
+      StartingPosition: LATEST
+      BatchSize: 50
+      MaximumBatchingWindowInSeconds: 5
+
+  # ===========================================================================
+  # ALERTING (SNS + Step Functions)
+  # ===========================================================================
+
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-critical-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  StandardAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-standard-alerts'
+
+  InvestigationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/states/${EnvironmentName}-investigation'
+      RetentionInDays: 7
+
+  InvestigationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${EnvironmentName}-investigation'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: Fraud alert triage — auto-block CRITICAL, review HIGH, monitor MEDIUM/LOW
+        StartAt: SeverityGate
+        TimeoutSeconds: 300
+        States:
+          SeverityGate:
+            Type: Choice
+            Choices:
+              - Variable: $.severity
+                StringEquals: CRITICAL
+                Next: AutoBlock
+              - Variable: $.severity
+                StringEquals: HIGH
+                Next: FlagForReview
+            Default: MonitorWatchlist
+          AutoBlock:
+            Type: Task
+            Resource: !Sub 'arn:${AWS::Partition}:states:::dynamodb:putItem'
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id:  {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision:  {S: AUTO_BLOCK}
+                status:    {S: BLOCKED}
+            End: true
+          FlagForReview:
+            Type: Task
+            Resource: !Sub 'arn:${AWS::Partition}:states:::dynamodb:putItem'
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id:  {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision:  {S: FLAG_FOR_REVIEW}
+                status:    {S: REVIEWING}
+            End: true
+          MonitorWatchlist:
+            Type: Task
+            Resource: !Sub 'arn:${AWS::Partition}:states:::dynamodb:putItem'
+            Parameters:
+              TableName: !Ref AlertsTable
+              Item:
+                alert_id:  {S.$: $.alert_id}
+                created_at: {N: '0'}
+                decision:  {S: MONITOR}
+                status:    {S: WATCHLIST}
+            End: true
+
+
+  # ===========================================================================
+  # ECS FARGATE — DATA GENERATOR
+  # ===========================================================================
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-datagen'
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+
+  DatagenLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-datagen'
+      RetentionInDays: 7
+
+  DatagenTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-datagen'
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: datagen
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}:latest'
+          Essential: true
+          Environment:
+            - {Name: STREAM_TRADES,        Value: !Ref TradesStream}
+            - {Name: STREAM_SESSIONS,      Value: !Ref SessionsStream}
+            - {Name: STREAM_REGISTRATIONS, Value: !Ref RegistrationsStream}
+            - {Name: STREAM_API_CALLS,     Value: !Ref ApiCallsStream}
+            - {Name: RDS_ENDPOINT,         Value: !GetAtt RdsInstance.Endpoint.Address}
+            - {Name: RDS_SECRET_ARN,       Value: !Ref RdsSecret}
+            - {Name: RAW_DATA_BUCKET,      Value: !Ref RawDataBucket}
+            - {Name: ENRICHMENT_BUCKET,    Value: !Ref EnrichmentBucket}
+            - {Name: AWS_DEFAULT_REGION,   Value: !Ref 'AWS::Region'}
+            - {Name: SCENARIO,             Value: !Ref GeneratorScenario}
+            - {Name: TPS,                  Value: !Sub '${GeneratorTps}'}
+            - {Name: TOTAL_ACCOUNTS,       Value: !Sub '${GeneratorAccounts}'}
+            - {Name: FRAUD_RATE,           Value: '0.15'}
+            - {Name: USE_KINESIS,          Value: 'true'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DatagenLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: datagen
+
+  # ===========================================================================
+  # CODEBUILD BOOTSTRAP
+  # Builds Docker image, pushes to ECR, launches ECS Fargate task.
+  # Run ONCE after CREATE_COMPLETE:
+  #   aws codebuild start-build --project-name <BootstrapProjectName>
+  # The buildspec and data_generator source are embedded in the bootstrap
+  # bucket by the packager (package.py) before deployment.
+  # ===========================================================================
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${EnvironmentName}-bootstrap'
+      RetentionInDays: 7
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: SourceUploader
+    Properties:
+      Name: !Sub '${EnvironmentName}-bootstrap'
+      Description: >
+        Builds the data-generator Docker image, pushes it to ECR,
+        and starts the ECS Fargate task. Run once after CREATE_COMPLETE.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: AWS_ACCOUNT_ID,     Value: !Ref 'AWS::AccountId'}
+          - {Name: AWS_DEFAULT_REGION, Value: !Ref 'AWS::Region'}
+          - {Name: ECR_REPO_URI,       Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}'}
+          - {Name: ENV_NAME,           Value: !Ref EnvironmentName}
+          - {Name: ECS_CLUSTER,        Value: !Sub '${EnvironmentName}-datagen'}
+          - {Name: ECS_TASK_DEF,       Value: !Sub '${EnvironmentName}-datagen'}
+          - {Name: ECS_SUBNET,         Value: !Ref PublicSubnet1}
+          - {Name: ECS_SG,             Value: !Ref EcsSG}
+      Source:
+        Type: S3
+        Location: !Sub '${BootstrapBucket}/buildspec/source.zip'
+      VpcConfig:
+        VpcId: !Ref VPC
+        Subnets: [!Ref PrivateSubnet1]
+        SecurityGroupIds: [!Ref CodeBuildSG]
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Tags: [{Key: Project, Value: FraudDetectionDemo}]
+
+
+  # =========================================================================
+  # SOURCE UPLOADER (injected by package_quicksight.py)
+  # Decodes the embedded data-generator zip and writes it to the
+  # BootstrapBucket so CodeBuild can build the image. Makes the stack
+  # fully self-contained — no manual S3 upload required.
+  # =========================================================================
+  SourceUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UploadSourceZip
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${BootstrapBucket.Arn}/*'
+
+  SourceUploaderFunc:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-source-uploader'
+      Runtime: python3.11
+      Role: !GetAtt SourceUploaderRole.Arn
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import base64, boto3, cfnresponse
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  p = event['ResourceProperties']
+                  boto3.client('s3').put_object(
+                      Bucket=p['Bucket'], Key=p['Key'],
+                      Body=base64.b64decode(p['ZipBase64']))
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {'Bucket': p['Bucket'], 'Key': p['Key']})
+              except Exception as exc:
+                  print('SourceUploader error: ' + str(exc))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(exc)})
+
+  SourceUploader:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [BootstrapBucket, SourceUploaderFunc]
+    Properties:
+      ServiceToken: !GetAtt SourceUploaderFunc.Arn
+      Bucket: !Ref BootstrapBucket
+      Key: buildspec/source.zip
+      ZipHash: 'UEsDBBQAAAAIAG5+'
+      ZipBase64: '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'
+
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  BootstrapBucketName:
+    Value: !Ref BootstrapBucket
+    Description: Upload source.zip here before running CodeBuild
+
+  BootstrapProjectName:
+    Value: !Ref BootstrapProject
+    Description: Run after CREATE_COMPLETE to build Docker image and start ECS
+
+  BootstrapCommand:
+    Value: !Sub 'aws codebuild start-build --project-name ${BootstrapProject} --region ${AWS::Region}'
+    Description: Exact command to trigger the bootstrap
+
+  TradesStreamName:
+    Value: !Ref TradesStream
+    Description: Kinesis stream for trade events
+
+  SessionsStreamName:
+    Value: !Ref SessionsStream
+    Description: Kinesis stream for session events
+
+  AlertsStreamName:
+    Value: !Ref AlertsStream
+    Description: Kinesis stream for fraud alerts
+
+  RdsEndpoint:
+    Value: !GetAtt RdsInstance.Endpoint.Address
+    Description: RDS PostgreSQL endpoint
+
+  AnalyticsBucketName:
+    Value: !Ref AnalyticsBucket
+    Description: S3 bucket where Firehose lands Parquet files (alerts + trades)
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue Data Catalog database name for Athena queries
+
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Description: Athena workgroup — use this when running ad-hoc queries
+
+  AthenaResultsLocation:
+    Value: !Sub 's3://${AnalyticsBucket}/athena-results/'
+    Description: S3 prefix for Athena query results
+
+  AlertsFirehoseName:
+    Value: !Ref AlertsFirehose
+    Description: Kinesis Firehose delivery stream for alerts → S3 (Parquet)
+
+  TradesFirehoseName:
+    Value: !Ref TradesFirehose
+    Description: Kinesis Firehose delivery stream for trades → S3 (Parquet)
+
+  QuickSightDataSourceId:
+    Value: !Sub '${EnvironmentName}-athena-source'
+    Description: QuickSight data source ID — use to build additional analyses
+
+  QuickSightDatasetsNote:
+    Value: !Sub >
+      Four datasets provisioned: ${EnvironmentName}-alerts-overview-ds,
+      ${EnvironmentName}-entity-risk-ds, ${EnvironmentName}-alert-feed-ds,
+      ${EnvironmentName}-trade-activity-ds.
+      Open QuickSight → Datasets to create analyses and dashboards.
+    Description: QuickSight datasets created by this stack
+
+  AlertsTableName:
+    Value: !Ref AlertsTable
+    Description: DynamoDB alerts table (used by Step Functions triage)
+
+  EcrRepositoryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DatagenEcrRepo}'
+    Description: ECR URI for data generator image
+
+  DeploymentSummary:
+    Value: !Sub |
+      Stack deployed. Next steps:
+      1. Upload source.zip to S3, then run bootstrap CodeBuild project.
+         Command: aws codebuild start-build --project-name ${BootstrapProject}
+      2. Confirm the SNS subscription email in your inbox.
+      3. Wait ~15 min for the first Glue crawler run to populate partitions.
+      4. Open QuickSight → Datasets and trigger an initial SPICE refresh on
+         the three SPICE datasets (alerts-overview, entity-risk, trade-activity).
+      5. Create analyses from the datasets or use the pre-built named Athena
+         queries in workgroup: ${AthenaWorkgroup}
+      Analytics bucket: s3://${AnalyticsBucket}/
+      Athena workgroup: ${AthenaWorkgroup}
+      Glue database:    ${GlueDatabase}
+    Description: Post-deployment checklist
+

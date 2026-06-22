@@ -1,211 +1,256 @@
-# Forex/CFD Fraud Detection Demo
+# Fraud Detection Demo — QuickSight Edition
 
-Real-time fraud detection platform combining rule-based and ML-based detection
-across three typologies: Coordinated Trading, System Abuse & Abusive Registrations,
-and Account Takeover (ATO).
+Replaces OpenSearch Dashboards with **Amazon QuickSight** as the visualization layer, reducing cost by ~$3/hr while providing a fully managed, shareable BI dashboard for fraud monitoring.
+
+---
 
 ## Architecture
 
 ```
-Data Generator (ECS Fargate)
-    - MSK (Kafka) — 7 topics
-    - Amazon Managed Flink — 3 detection apps
-    - SageMaker Endpoints — 3 ML models
-    - Neptune — account graph
-    - OpenSearch — dashboards & alerting
-    - DynamoDB — alert store & velocity counters
-    - RDS PostgreSQL — account master data
-    - SNS + EventBridge — alert fan-out
+ECS Fargate (data generator)
+        │
+        ├──► Kinesis: trades / sessions / registrations / api-calls
+        │          │
+        │          └──► Lambda Detectors (heuristics)
+        │                      │
+        │                      └──► Kinesis: alerts
+        │                                  │
+        │                    ┌─────────────┴────────────┐
+        │                    ▼                          ▼
+        │           Lambda AlertProcessor          Firehose (alerts)
+        │                 │   │                       │
+        │           DynamoDB  SNS (email)             │
+        │           (triage)                          │
+        │                 │                           ▼
+        │          Step Functions          S3 Analytics Bucket
+        │          (auto-block /         /alerts/year=.../month=.../day=.../
+        │           flag / monitor)
+        │
+        └──► Kinesis: trades ──► Firehose (trades) ──► S3 Analytics Bucket
+                                                      /trades/year=.../month=.../day=.../
+
+S3 Analytics Bucket
+    └──► Glue Crawlers (every 15 min) ──► Glue Data Catalog
+                                              └──► Athena Workgroup
+                                                       └──► QuickSight
+                                                            ├── Fraud Overview (SPICE)
+                                                            ├── Entity Risk Monitor (SPICE)
+                                                            ├── Alert Feed (Direct Query)
+                                                            └── Trade Activity (SPICE)
 ```
 
-## Project Structure
+### What changed from the original
+
+| Removed | Replaced with |
+|---|---|
+| Amazon OpenSearch Service (`m5.large.search`, 100 GB EBS) | — |
+| OpenSearch indexing in `AlertProcessorLambda` | Kinesis Data Firehose (automatic, no Lambda code) |
+| OpenSearch Dashboards (VPC-private, SigV4 auth) | Amazon QuickSight (SaaS, no VPC, shareable links) |
+
+---
+
+## Region support
+
+The stack is **region-agnostic**. Every resource derives its region and
+partition from the CloudFormation pseudo-parameters (`AWS::Region`,
+`AWS::Partition`, `AWS::AccountId`), so it deploys unchanged into any region —
+or partition — where the underlying services are available.
+
+Just deploy from a CloudShell session opened in your target region (or pass
+`--region <your-region>` to the AWS CLI). The whole demo runs there.
+
+Required services (confirm availability in your chosen region): Kinesis Data
+Streams, Kinesis Data Firehose, Lambda, ECS Fargate, ECR, CodeBuild, RDS
+PostgreSQL, DynamoDB, Glue, Athena, Step Functions, SNS, and QuickSight.
+
+---
+
+## Pre-requisites
+
+1. **AWS account** with `AdministratorAccess` (demo account recommended)
+2. **Amazon QuickSight must be enabled** in the account/region — this is a
+   one-time manual action that cannot be automated via CloudFormation:
+   - Go to the AWS Console → QuickSight → Sign up for QuickSight
+   - Choose **Enterprise** edition (required for SPICE + Athena integration)
+   - Make sure QuickSight is enabled in the **same region** you deploy into.
+   - Note the **QuickSight username** of the admin user (shown on the
+     QuickSight account settings page). You'll need this for the parameter.
+3. **AWS CloudShell** (or any shell with the AWS CLI configured). Nothing else
+   is required — no Node.js, Docker, CDK, or Python on your machine.
+
+> The `package_quicksight.py` script and the `source_extracted/` tree are
+> developer build inputs only. The deployer needs just the single packaged
+> template file produced below.
+
+---
+
+## Step 1 — Get the packaged template
+
+Download (or copy into CloudShell) the single self-contained file:
 
 ```
-README.md                          ← This file
-cdk/                               ← CDK infrastructure (Python)
--    app.py                        ← CDK app entry point
--    cdk.json
--    requirements.txt
--   └── stacks/
--        networking_stack.py
--        data_storage_stack.py
--        streaming_stack.py
--        graph_stack.py
--        search_stack.py
--        ml_stack.py
--        processing_stack.py
--        alerting_stack.py
--       └── compute_stack.py
- data_generator/                    ← Synthetic data generator (Python)
--    Dockerfile
--    requirements.txt
--    main.py                        ← Entry point
--    config.py                      ← Runtime configuration
--    personas/                      ← Fraud persona implementations
--   -    base.py
--   -    normal_trader.py
--   -    coordinated_ring.py
--   -    system_abuser.py
--   -    abusive_registrant.py
--   -   └── ato_attacker.py
--    producers/                     ← Kafka topic producers
--   -    trade_producer.py
--   -    session_producer.py
--   -    registration_producer.py
--   -   └── api_call_producer.py
--    seeders/                       ← RDS & S3 data seeders
--   -    rds_seeder.py
--   -   └── s3_seeder.py
--   └── utils/
--        geo_data.py
--        device_fingerprint.py
--       └── kyc_generator.py
- flink_jobs/                        ← Flink Python/SQL jobs
--    coordinated_trading/
--   -    job.py
--   -   └── rules.py
--    system_abuse/
--   -    job.py
--   -   └── rules.py
--   └── account_takeover/
--        job.py
--       └── rules.py
- ml_models/                         ← SageMaker training notebooks & inference
--    coordinated_trading/
--   -    train.py
--   -   └── inference.py
--    registration_anomaly/
--   -    train.py
--   -   └── inference.py
--   └── login_risk/
--        train.py
--       └── inference.py
- lambda_functions/                  ← Lambda alert handlers
--    alert_processor/
--   -    handler.py
--   -   └── requirements.txt
--   └── topic_initializer/
--        handler.py
--       └── requirements.txt
- opensearch/                        ← OpenSearch index templates & dashboards
--    index_templates/
--   -    fraud_events.json
--   -    fraud_alerts.json
--   -   └── fraud_entities.json
--   └── dashboards/
--        fraud_overview.ndjson
--        coordinated_trading.ndjson
--        system_abuse.ndjson
--       └── account_takeover.ndjson
- db/                                ← Database schema & seed scripts
--    schema.sql
--   └── seed_reference_data.sql
- scripts/                           ← Deployment & utility scripts
--    deploy.sh
--    setup_kafka_topics.py
--    upload_ml_models.py
--   └── setup_opensearch.py
-└── docs/
-    └── demo_runbook.md                ← Step-by-step presenter guide
+fraud-detection-quicksight-packaged.yaml
 ```
 
-## Prerequisites
+It already embeds the data-generator source and a `SourceUploader` custom
+resource that uploads it to S3 at deploy time — so there is **no manual S3
+upload and no separate packaging step** for the deployer.
 
-- AWS CLI configured with sufficient IAM permissions
-- AWS CDK v2 (`npm install -g aws-cdk`)
-- Python 3.11+
-- Docker (for building data generator image)
-- Node.js 18+ (for CDK)
+> Regenerating the template (developers only): `pip install pyyaml &&
+> python package_quicksight.py`.
 
-## Deployment Steps
+---
 
-### 1. Bootstrap CDK (first time only)
-```bash
-cd cdk
-pip install -r requirements.txt
-cdk bootstrap
-```
+## Step 2 — Deploy
 
-### 2. Deploy infrastructure
-```bash
-cd cdk
-cdk deploy --all --require-approval never \
-  --parameters RdsMasterPassword=YourSecurePassword123! \
-  --parameters AlertEmail=your-email@example.com
-```
-
-### 3. Set up Kafka topics
-```bash
-MSK_CLUSTER_ARN=$(aws cloudformation describe-stacks \
-  --stack-name FraudDemo-Streaming \
-  --query "Stacks[0].Outputs[?OutputKey=='MskClusterArn'].OutputValue" \
-  --output text)
-
-python scripts/setup_kafka_topics.py --cluster-arn $MSK_CLUSTER_ARN
-```
-
-### 4. Set up OpenSearch indices and dashboards
-```bash
-OPENSEARCH_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name FraudDemo-Search \
-  --query "Stacks[0].Outputs[?OutputKey=='OpenSearchEndpoint'].OutputValue" \
-  --output text)
-
-python scripts/setup_opensearch.py --endpoint $OPENSEARCH_ENDPOINT
-```
-
-### 5. Train and upload ML models
-```bash
-python scripts/upload_ml_models.py --region us-east-1
-```
-
-### 6. Start data generator
-```bash
-# Via ECS (production demo)
-aws ecs run-task \
-  --cluster fraud-demo-datagen \
-  --task-definition fraud-demo-datagen \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[...],securityGroups=[...],assignPublicIp=DISABLED}"
-
-# Or locally for testing
-cd data_generator
-pip install -r requirements.txt
-python main.py --scenario mixed --tps 100 --accounts 500
-```
-
-### 7. Start Flink applications
-```bash
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-coordinated-trading \
-  --run-configuration '{}'
-
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-system-abuse \
-  --run-configuration '{}'
-
-aws kinesisanalyticsv2 start-application \
-  --application-name fraud-demo-account-takeover \
-  --run-configuration '{}'
-```
-
-## Demo Scenarios
-
-See [docs/demo_runbook.md](docs/demo_runbook.md) for the full presenter guide.
-
-| Scenario | Generator flag | What to show |
-|----------|---------------|--------------|
-| Baseline | `--scenario normal` | Clean dashboard, no alerts |
-| System Abuse | `--scenario registration_burst` | Rule-based alerts firing in seconds |
-| ATO | `--scenario ato_attack` | Geo-velocity alert + ML behavioural score |
-| Coordinated Ring | `--scenario coordinated_ring` | Rules pass, ML graph clustering fires |
-| All typologies | `--scenario mixed` | Full dashboard demo |
-
-## Tear Down
+The packaged template is ~124 KB — under the 460 KB console limit — so you can
+upload it directly in the CloudFormation console, or deploy it from CloudShell
+with one command (it uses the region of your current session):
 
 ```bash
-cd cdk
-cdk destroy --all
+aws cloudformation deploy \
+  --template-file fraud-detection-quicksight-packaged.yaml \
+  --stack-name fraud-detection-quicksight \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    AlertEmail=your-email@example.com \
+    RdsMasterPassword=YourPassword123! \
+    QuickSightUserName=your-qs-username
 ```
 
-> **Note:** S3 buckets and DynamoDB tables use `RemovalPolicy.DESTROY`. All data will be deleted on stack destruction.
+To target a specific region, add `--region <your-region>` (otherwise the CLI
+uses the region configured in your session).
+
+---
+
+## Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| **AlertEmail** | — | **Required.** Email for CRITICAL/HIGH alert notifications |
+| **RdsMasterPassword** | — | **Required.** Min 12 characters |
+| **QuickSightUserName** | — | **Required.** Your QuickSight username (the username portion only, e.g. `admin`) |
+| GeneratorScenario | `mixed` | `mixed`, `coordinated_ring`, `ato_attack`, `registration_burst`, `system_abuse` |
+| GeneratorTps | `100` | Events per second (10–500) |
+| GeneratorAccounts | `500` | Synthetic accounts (100–5000) |
+| RdsInstanceClass | `db.r5.large` | RDS instance size |
+
+---
+
+## Step 3 — Run the bootstrap (once, after CREATE_COMPLETE)
+
+The stack outputs the exact command:
+
+```bash
+aws codebuild start-build --project-name fraud-demo-bootstrap
+```
+
+(Add `--region <your-region>` if your CLI session isn't already set to the
+region you deployed into.) This builds the Docker image and starts the ECS
+Fargate data generator (~10 min).
+
+---
+
+## Step 4 — Post-deployment
+
+### 4a. Confirm SNS subscription
+Check your inbox for the AWS notification email and click **Confirm subscription**.
+
+### 4b. Wait for the first Glue crawler run
+The Glue crawlers run on a 15-minute schedule. After the first run, the
+`alerts` and `trades` tables will appear in the Glue Data Catalog and
+Athena will be able to query them.
+
+You can trigger a crawler immediately from the console:
+```
+AWS Console → Glue → Crawlers → fraud-demo-alerts-crawler → Run
+AWS Console → Glue → Crawlers → fraud-demo-trades-crawler → Run
+```
+
+### 4c. Refresh SPICE datasets
+Open **QuickSight → Datasets** and trigger a manual SPICE ingestion for
+the three SPICE datasets:
+- `fraud-demo Fraud Alerts Overview`
+- `fraud-demo Entity Risk Monitor`
+- `fraud-demo Trade Activity`
+
+The **Alert Feed (Live)** dataset uses Direct Query and needs no refresh.
+
+### 4d. Create dashboards
+Open **QuickSight → Datasets**, select a dataset, and click **Create analysis**.
+Use the pre-built Athena named queries as a reference for the recommended
+visualizations:
+
+| Dataset | Suggested visuals |
+|---|---|
+| Fraud Alerts Overview | Line chart: alerts/day by severity; Donut: by typology; KPI tiles: total, critical count, avg risk score |
+| Entity Risk Monitor | Table: top 20 entities by risk score; Scatter: risk_score vs alert count |
+| Alert Feed (Live) | Filterable table with severity, typology, date range filters |
+| Trade Activity | Bar: volume by instrument; Line: trade count over time; colour by label (normal vs fraud) |
+
+---
+
+## Data flow timing
+
+| Event | Latency |
+|---|---|
+| Trade/session event → Kinesis | < 1 second |
+| Kinesis → Lambda detector → AlertsStream | 1–5 seconds |
+| AlertsStream → Firehose → S3 (Parquet) | 60 seconds (buffer) |
+| S3 new partition → Glue crawler → Athena visible | up to 15 minutes |
+| Athena query → QuickSight SPICE refresh | on-demand or scheduled |
+| QuickSight Direct Query (Alert Feed) | real-time (Athena query on page load) |
+
+---
+
+## Cost estimate
+
+~$7–10/hr while running (compared to ~$10–16/hr for the original):
+
+| Service | Cost |
+|---|---|
+| RDS PostgreSQL `db.r5.large` | ~$0.48/hr |
+| ECS Fargate (1 vCPU, 2 GB) | ~$0.06/hr |
+| Kinesis Streams (7 shards) | ~$0.21/hr |
+| Kinesis Firehose (2 streams) | ~$0.01/hr |
+| NAT Gateway | ~$0.045/hr + data transfer |
+| Glue Crawlers (4 DPU × 15 min × 2) | ~$0.03/hr |
+| S3 Analytics Bucket | ~$0.002/hr |
+| Athena queries | ~$0.005/hr (SPICE refreshes) |
+| **QuickSight** | **$24/month flat (1 author)** |
+| ~~OpenSearch~~ | ~~$3/hr~~ → **removed** |
+
+---
+
+## Cleanup
+
+```bash
+aws cloudformation delete-stack --stack-name fraud-detection-quicksight
+```
+
+Note: DynamoDB tables, S3 buckets, and the ECR repository have
+`DeletionPolicy: Delete` and will be removed with the stack.
+
+---
+
+## Troubleshooting
+
+**Firehose not delivering to S3**
+- Check the Firehose CloudWatch log group `/aws/kinesisfirehose/fraud-demo-alerts`
+- Common cause: the Glue table schema doesn't match the JSON shape. Check
+  that the `alerts` Glue table columns match the fields in the alert events.
+
+**QuickSight "Insufficient permissions" on data source**
+- Confirm that QuickSight has been granted access to the Athena workgroup and
+  S3 bucket in the QuickSight console under **Manage QuickSight → Security & permissions**.
+- The `AnalyticsBucketPolicy` in the stack grants `quicksight.amazonaws.com`
+  read access — ensure this deployed cleanly.
+
+**No data in Athena after 30 minutes**
+- Verify the ECS task is running: `AWS Console → ECS → fraud-demo-datagen → Tasks`
+- Verify the Firehose is consuming from Kinesis: check the Firehose monitoring
+  metrics for `IncomingRecords`.
+- Trigger the Glue crawler manually to force partition discovery.
+
+**QuickSight dataset refresh fails with "Table not found"**
+- The Glue crawler hasn't run yet. Trigger it manually (see Step 4b above).
